@@ -127,7 +127,7 @@ async function ensureVictionAfterUnlock(){
           chainName: "Viction Mainnet",
           nativeCurrency: { name:"VIC", symbol:"VIC", decimals:18 },
           rpcUrls: ["https://rpc.viction.xyz"],
-          blockExplorerUrls: ["https://scan.viction.xyz"]
+          blockExplorerUrls: ["https://vicscan.xyz"]
         }]
       });
     }else{ throw err; }
