@@ -336,90 +336,71 @@ $(".modal#formCreate .close")?.addEventListener("click",()=> hide($("#formCreate
 $("#btnSubmitCreate")?.addEventListener("click", submitCreate);
 async function submitCreate(){
   if (!account){ toast("Hãy kết nối ví."); return; }
-  if (!isRegistered){ toast("Bạn chưa đăng ký ví."); return; }
+  if (!isRegistered){ toast("Ví này chưa đăng ký. Vui lòng bấm ‘Đăng ký’."); return; }
+
+  const name  = ($("#createName").value||"").trim();
+  const img   = ($("#createImage").value||"").trim();
+  const desc  = ($("#createDesc").value||"").trim();
+  const days  = parseInt(($("#createDays").value||"").trim(), 10);
+  const walle = ($("#createWallet").value||"").trim();
+  const priceInput = parseVND($("#createPrice").value);
+
+  if (!name){ toast("Vui lòng nhập tên sản phẩm."); return; }
+  if (!Number.isFinite(priceInput) || priceInput <= 0){ toast("Giá (VND) phải > 0."); return; }
+  if (!Number.isInteger(days) || days <= 0){ toast("Số ngày giao ≥ 1."); return; }
+  if (!ethers.utils.isAddress(walle)){ toast("Ví nhận thanh toán không hợp lệ."); return; }
+
+  const priceVND = ethers.BigNumber.from(String(priceInput));
+  const imageCID = img;
+  const descriptionCID = desc;
+  const wallet = walle;
+
+  // 1) Simulate để bắt reason rõ ràng (NOT_REGISTERED / PRICE_REQUIRED / ...)
   try{
-    const name=($("#createName").value||"").slice(0,500).trim();
-    const ipfs=($("#createIPFS").value||"").trim();
-    const unit=($("#createUnit").value||"").trim();
-    const price=parseVND($("#createPrice").value);
-    const wallet=($("#createWallet").value||"").trim();
-    const days = Number($("#createDays").value||0);
-
-    if (!name||!ipfs||!unit||!price||!wallet||!days){ toast("Vui lòng nhập đủ thông tin."); return; }
-    if (!ethers.utils.isAddress(wallet)){ toast("Ví nhận thanh toán không hợp lệ."); return; }
-    const descriptionCID = `unit:${unit}`;
-    const imageCID = ipfs;
-
-    // simulate -> nếu sai điều kiện sẽ báo reason, không mở MetaMask
-    try{
-      const txData = await muaban.populateTransaction.createProduct(
-        name, descriptionCID, imageCID,
-        ethers.BigNumber.from(String(price)), days, wallet, true
-      );
-      txData.from = account;
-      await providerWrite.call(txData);
-    }catch(simErr){
-      toast(parseRevert(simErr));
-      return;
-    }
-
-    // send với gas tối đa
-    try{
-      const tx = await muaban.createProduct(
-        name, descriptionCID, imageCID,
-        ethers.BigNumber.from(String(price)), days, wallet, true,
-        highOverrides("heavy")
-      );
-      await tx.wait();
-    }catch(sendErr){
-      showRpc(sendErr, "send.createProduct");
-      return;
-    }
-
-    hide($("#formCreate"));
-    toast("Đăng sản phẩm thành công.");
-    await loadAllProducts();
-  }catch(e){ showRpc(e, "submitCreate.catch"); }
-}
-
-function openUpdateForm(pid, p){
-  $("#updatePid").value = String(pid);
-  $("#updatePrice").value = String(p.priceVND||"");
-  $("#updateDays").value  = String(p.deliveryDaysMax||"");
-  $("#updateWallet").value= String(p.payoutWallet||"");
-  $("#updateActive").checked = !!p.active;
-  show($("#formUpdate"));
-}
-$(".modal#formUpdate .close")?.addEventListener("click",()=> hide($("#formUpdate")));
-$("#btnSubmitUpdate")?.addEventListener("click", async ()=>{
-  if (!account){ toast("Hãy kết nối ví."); return; }
-  try{
-    const pid   = Number($("#updatePid").value||0);
-    const price = parseVND($("#updatePrice").value);
-    const days  = Number($("#updateDays").value||0);
-    const wallet= ($("#updateWallet").value||"").trim();
-    const active= !!$("#updateActive").checked;
-    if (!pid||!price||!days||!wallet){ toast("Vui lòng nhập đủ thông tin."); return; }
-    if (!ethers.utils.isAddress(wallet)){ toast("Ví nhận thanh toán không hợp lệ."); return; }
-
-    // simulate
-    const txData = await muaban.populateTransaction.updateProduct(
-      pid, ethers.BigNumber.from(String(price)), days, wallet, active
+    const txData = await muaban.populateTransaction.createProduct(
+      name, descriptionCID, imageCID, priceVND, days, wallet, true
     );
-    txData.from = account;
+    txData.from = account;           // QUAN TRỌNG cho simulate chính xác
     await providerWrite.call(txData);
+  }catch(simErr){
+    toast(parseRevert(simErr));
+    return;
+  }
 
-    // send high gas
-    const tx = await muaban.updateProduct(
-      pid, ethers.BigNumber.from(String(price)), days, wallet, active, highOverrides("med")
+  // 2) Ước lượng gas rồi build overrides legacy
+  let est = null;
+  try{
+    // dùng signer -> estimateGas theo đúng context
+    est = await muaban.estimateGas.createProduct(
+      name, descriptionCID, imageCID, priceVND, days, wallet, true
+    );
+  }catch(_){ /* fallback sẽ dùng trong buildOverrides */ }
+
+  const ov = await buildOverrides("heavy", est);
+
+  // 3) Kiểm tra đủ VIC để trả phí gas trước khi ký/gửi
+  const enough = await ensureEnoughVicForGas(ov);
+  if (!enough) return;
+
+  // 4) Gửi giao dịch (legacy type 0)
+  try{
+    console.log("Sending create product transaction with overrides:", ov); // Debug gas & tx
+    const tx = await muaban.createProduct(
+      name, descriptionCID, imageCID, priceVND, days, wallet, true, ov
     );
     await tx.wait();
+  }catch(sendErr){
+    console.error("Error sending transaction:", sendErr);  // Log chi tiết lỗi
+    showRpc(sendErr, "send.createProduct");
+    return;
+  }
 
-    hide($("#formUpdate"));
-    toast("Cập nhật thành công.");
-    await loadAllProducts();
-  }catch(e){ showRpc(e, "updateProduct.send"); }
-});
+  // 5) Thành công
+  alert("Đăng sản phẩm thành công.");
+  hide($("#formCreate"));
+  const { muabanR } = initContractsForRead();
+  await loadAllProducts(muabanR);
+}
 
 /* -------------------- Mua hàng & Đơn hàng (giữ như trước) -------------------- */
 function openBuyForm(pid, p){
