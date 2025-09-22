@@ -1,12 +1,11 @@
-<!-- app.js (drop-in replacement) -->
 <script>
 /* ====================================================================
    muaban.vin — app.js (ethers v5)
-   MỤC TIÊU: sửa "Internal JSON-RPC error" khi ký giao dịch & ổn định UI
-   - ÉP legacy tx (type 0) + gasPrice; KHÔNG dùng EIP-1559 trên VIC
-   - Preflight (populateTransaction + provider.call({from})) để bắt revert
-   - Tỷ giá VIN/VND theo mô tả; có thể override qua <body data-vin-vnd="...">
-   - Khớp HTML & ABI: index.html / style.css / Muaban_ABI.json / VinToken_ABI.json
+   Mục tiêu:
+   - Khắc phục “Internal JSON-RPC error.” bằng cách:
+     + Ép legacy tx (type:0) + gasPrice (VIC không dùng EIP-1559)
+     + Preflight (populateTransaction + provider.call({from})) để bắt reason
+   - Khớp đúng ID theo index.html; hiển thị giá VIN/VND ổn định
 ==================================================================== */
 
 /* -------------------- DOM helpers -------------------- */
@@ -22,11 +21,14 @@ const DEFAULTS = {
   CHAIN_ID: 88,
   RPC_URL: "https://rpc.viction.xyz",
   EXPLORER: "https://vicscan.xyz",
+  // Có thể override qua <body data-muaban-addr="..." data-vin-addr="...">
   MUABAN_ADDR: "0x190FD18820498872354eED9C4C080cB365Cd12E0",
   VIN_ADDR:    "0x941F63807401efCE8afe3C9d88d368bAA287Fac4",
-  // Phí đăng ký 0.001 VIN
+
+  // Phí đăng ký 0.001 VIN (18 decimals)
   REG_FEE_WEI: "1000000000000000",
-  // Nguồn tỷ giá (đa nguồn + fallback)
+
+  // Nguồn tỷ giá
   COINGECKO_VIC_VND: "https://api.coingecko.com/api/v3/simple/price?ids=viction&vs_currencies=vnd",
   COINGECKO_USD_VND: "https://api.coingecko.com/api/v3/simple/price?ids=tether&vs_currencies=vnd",
   COINGECKO_VIC_USD: "https://api.coingecko.com/api/v3/simple/price?ids=viction&vs_currencies=usd",
@@ -34,20 +36,19 @@ const DEFAULTS = {
 };
 
 /* ---- GAS/FEES: ép legacy (gasPrice), không dùng EIP-1559 ---- */
-const GAS_LIMIT_LIGHT = ethers.BigNumber.from("200000");   // approve / confirm / refund
-const GAS_LIMIT_MED   = ethers.BigNumber.from("400000");   // payRegistration / updateProduct / placeOrder
+const GAS_LIMIT_LIGHT = ethers.BigNumber.from("200000");   // approve/confirm/refund
+const GAS_LIMIT_MED   = ethers.BigNumber.from("400000");   // payRegistration/update/placeOrder
 const GAS_LIMIT_HEAVY = ethers.BigNumber.from("800000");   // createProduct
-const LEGACY_GAS_PRICE_GWEI = "50"; // tăng nếu cần
+const LEGACY_GAS_PRICE_GWEI = "50";
 
 /* -------------------- State -------------------- */
 let providerRead, providerWrite, signer, account;
 let MUABAN_ABI, VIN_ABI;
-let muabanR, vinR; // đọc
-let muaban,  vin;  // ghi
+let muabanR, vinR; // read
+let muaban,  vin;  // write
 
 let isRegistered = false;
-
-let vinPerVNDWei = ethers.BigNumber.from(0); // VIN wei cho 1 VND (ceil)
+let vinPerVNDWei = ethers.BigNumber.from(0); // VIN wei / 1 VND (ceil)
 let vinVND = 0;                               // 1 VIN = ? VND (floor)
 let productsCache = [];
 let ordersBuyer = [];
@@ -163,22 +164,22 @@ function bodyVinVndOverride(){
 }
 async function fetchVinToVND(){
   try{
-    // 1) Ưu tiên override
     const override = bodyVinVndOverride();
     if (override>0){
       vinVND = override;
     }else{
-      // 2) Nguồn chính: VIC→VND
+      // 1) VIC→VND (Coingecko)
       let vicVnd = 0;
       try{
         const r = await fetch(DEFAULTS.COINGECKO_VIC_VND);
         const j = await r.json();
         vicVnd = Number(j?.viction?.vnd||0);
       }catch(_){}
+
       if (vicVnd>0){
         vinVND = Math.floor(vicVnd * 100);
       }else{
-        // 3) VIC→USD × USDT→VND
+        // 2) VIC→USD × USDT→VND
         const [vicUsdRes, usdtVndRes] = await Promise.all([
           fetch(DEFAULTS.COINGECKO_VIC_USD),
           fetch(DEFAULTS.COINGECKO_USD_VND)
@@ -188,7 +189,7 @@ async function fetchVinToVND(){
         if (vicUsd>0 && usdtVnd>0){
           vinVND = Math.floor(vicUsd * 100 * usdtVnd);
         }else{
-          // 4) Binance VIC/USDT × USDT/VND
+          // 3) Binance VIC/USDT × USDT→VND
           const [vicPriceRes2, usdtVndRes2] = await Promise.all([
             fetch(DEFAULTS.BINANCE_VICUSDT),
             fetch(DEFAULTS.COINGECKO_USD_VND)
@@ -270,7 +271,7 @@ function refreshMenu(){
   menu?.classList.remove('hidden');
 }
 
-/* -------------------- Sản phẩm: load qua event & contract -------------------- */
+/* -------------------- Sản phẩm -------------------- */
 async function loadAllProducts(){
   try{
     const { MUABAN_ADDR } = readAddrs();
@@ -486,7 +487,7 @@ function openBuyForm(pid, p){
   modal.dataset.pid = String(pid);
   $("#buyQty").value = "1";
   $("#buyName").value = "";
-  $("#buyAddr").value = "";
+  $("#buyAddress").value = "";
   $("#buyPhone").value= "";
   $("#buyNote").value = "";
   updateTotalVinInBuyForm(p.priceVND||0, 1);
@@ -500,11 +501,10 @@ $("#buyQty")?.addEventListener("input", ()=>{
 });
 function updateTotalVinInBuyForm(priceVND, qty){
   const totalVND = (Number(priceVND)||0) * (Number(qty)||0);
-  if (vinPerVNDWei.isZero()){ $("#buyTotalVin").textContent = "VIN: …"; return; }
+  if (vinPerVNDWei.isZero()){ $("#buyTotalVIN").textContent = "VIN: …"; return; }
   const totalVinWei = ethers.BigNumber.from(String(totalVND)).mul(vinPerVNDWei);
-  $("#buyTotalVin").textContent = `~ ${parseFloat(ethers.utils.formatUnits(totalVinWei,18)).toFixed(6)} VIN`;
+  $("#buyTotalVIN").textContent = `~ ${parseFloat(ethers.utils.formatUnits(totalVinWei,18)).toFixed(6)} VIN`;
 }
-
 $("#btnSubmitBuy")?.addEventListener("click", async ()=>{
   if (!account){ toast("Hãy kết nối ví."); return; }
   if (vinPerVNDWei.isZero()){ toast("Chưa có tỷ giá VIN/VND. Vui lòng đợi giá."); return; }
@@ -515,13 +515,13 @@ $("#btnSubmitBuy")?.addEventListener("click", async ()=>{
 
     const qty   = Math.max(1, Number($("#buyQty").value||1));
     const name  = ($("#buyName").value||"").trim();
-    const addr  = ($("#buyAddr").value||"").trim();
+    const addr  = ($("#buyAddress").value||"").trim();
     const phone = ($("#buyPhone").value||"").trim();
     const note  = ($("#buyNote").value||"").trim();
 
     if (!name || !addr || !phone){ toast("Vui lòng nhập đầy đủ Họ tên / Địa chỉ / SĐT."); return; }
 
-    // Mã hoá tối giản (demo) — thực tế bạn có thể thay = AES công khai
+    // Mã hoá tối giản (demo)
     const buyerInfoCipher = btoa(JSON.stringify({name,addr,phone,note}));
 
     // Tính VIN cần escrow
@@ -539,7 +539,7 @@ $("#btnSubmitBuy")?.addEventListener("click", async ()=>{
       }catch(e){ showRpc(e, "approve.placeOrder"); return; }
     }
 
-    // simulate placeOrder(productId, quantity, vinPerVND, buyerInfoCipher)
+    // simulate: placeOrder(productId, quantity, vinPerVND, buyerInfoCipher)
     try{
       const txData = await muaban.populateTransaction.placeOrder(
         pid, qty, vinPerVNDWei.toString(), buyerInfoCipher
@@ -561,11 +561,10 @@ $("#btnSubmitBuy")?.addEventListener("click", async ()=>{
   }catch(e){ showRpc(e, "btnSubmitBuy.catch"); }
 });
 
-/* -------------------- Đơn hàng của tôi (buyer/seller) -------------------- */
+/* -------------------- Đơn hàng của tôi -------------------- */
 async function loadMyOrders(){
   try{
     if (!account){ return; }
-    // Cách đơn giản: quét event OrderPlaced, rồi lọc theo buyer/seller
     const { MUABAN_ADDR } = readAddrs();
     const iface = new ethers.utils.Interface(MUABAN_ABI);
     const topic = iface.getEventTopic("OrderPlaced");
@@ -577,9 +576,7 @@ async function loadMyOrders(){
       const oid = Number(ev.args.orderId);
       const pid = Number(ev.args.productId);
       const buyer = String(ev.args.buyer).toLowerCase();
-      // lấy seller từ product
-      buyer===account ? buyerOids.push(oid) : buyerOids;
-      // seller: phải gọi getProduct(pid)
+      if (buyer===account) buyerOids.push(oid);
       sellerOids.push({oid, pid});
     });
 
