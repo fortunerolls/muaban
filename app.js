@@ -1,6 +1,9 @@
 /* ====================================================================
-   muaban.vin — app.js (ethers v5)
-   Bản ổn định: tự chọn chế độ gas (EIP-1559/legacy), estimateGas + simulate
+   muaban.vin — app.js (High-Gas version, ethers v5)
+   - Legacy tx (type:0)
+   - gasPrice cố định siêu cao: 200 gwei
+   - gasLimit rộng: light 500k / med 1.2M / heavy 2.5M
+   - Simulate trước khi ký để lộ reason nếu hợp đồng revert
 ==================================================================== */
 
 /* -------------------- DOM helpers -------------------- */
@@ -18,24 +21,37 @@ const DEFAULTS = {
   EXPLORER: "https://vicscan.xyz",
   MUABAN_ADDR: "0x190FD18820498872354eED9C4C080cB365Cd12E0",
   VIN_ADDR:    "0x941F63807401efCE8afe3C9d88d368bAA287Fac4",
-  REG_FEE_WEI: "1000000000000000",
+  REG_FEE_WEI: "1000000000000000", // 0.001 VIN
+  // Giá VIN/VND (nếu muốn có hiển thị)
   COINGECKO_VIC_VND: "https://api.coingecko.com/api/v3/simple/price?ids=viction&vs_currencies=vnd",
   COINGECKO_USD_VND: "https://api.coingecko.com/api/v3/simple/price?ids=tether&vs_currencies=vnd",
   COINGECKO_VIC_USD: "https://api.coingecko.com/api/v3/simple/price?ids=viction&vs_currencies=usd",
   BINANCE_VICUSDT:   "https://api.binance.com/api/v3/ticker/price?symbol=VICUSDT",
 };
 
+/* -------------------- High GAS (legacy) -------------------- */
+const HIGH_GAS = {
+  gasPrice: ethers.utils.parseUnits("200", "gwei"), // đặt rất cao
+  light:    ethers.BigNumber.from("500000"),
+  med:      ethers.BigNumber.from("1200000"),
+  heavy:    ethers.BigNumber.from("2500000"),
+};
+function highOverrides(kind="med"){
+  const gasLimit = kind==="light" ? HIGH_GAS.light : kind==="heavy" ? HIGH_GAS.heavy : HIGH_GAS.med;
+  return { type: 0, gasPrice: HIGH_GAS.gasPrice, gasLimit };
+}
+
 /* -------------------- State -------------------- */
 let providerRead, providerWrite, signer, account;
-let MUABAN_ABI, VIN_ABI;       // load từ JSON
-let muabanR, vinR;             // contract read
-let muaban,  vin;              // contract write
+let MUABAN_ABI, VIN_ABI;
+let muabanR, vinR; // read
+let muaban,  vin;  // write
 let isRegistered = false;
 
 let vinPerVNDWei = ethers.BigNumber.from(0);
 let vinVND = 0;
 
-/* -------------------- Helpers -------------------- */
+/* -------------------- Utils -------------------- */
 function showRpc(err, tag="RPC"){
   const obj = {
     tag, code: err?.code,
@@ -83,7 +99,7 @@ function parseUnitFromCID(desc){
   return m? m[1].trim() : "";
 }
 
-/* -------------------- ABI & Address -------------------- */
+/* -------------------- ABI & địa chỉ -------------------- */
 async function loadAbis(){
   MUABAN_ABI = await fetch("Muaban_ABI.json").then(r=>r.json());
   VIN_ABI    = await fetch("VinToken_ABI.json").then(r=>r.json());
@@ -114,37 +130,7 @@ function initContractsForWrite(){
   vin    = new ethers.Contract(VIN_ADDR,    VIN_ABI,    signer);
 }
 
-/* -------------------- Fee overrides (Adaptive) -------------------- */
-async function buildOverrides(kind, txPromise){
-  // Ước lượng gas trước
-  let gasLimit;
-  try{
-    const est = await txPromise;
-    gasLimit = est.mul(120).div(100); // +20% biên an toàn
-  }catch(_){
-    // fallback nếu estimateGas lỗi (vẫn để node quyết định, hoặc dùng giá trị đủ lớn)
-    gasLimit = undefined;
-  }
-
-  // Tự phát hiện EIP-1559
-  let fee;
-  try{
-    const fd = await providerWrite.getFeeData();
-    if (fd?.maxFeePerGas && fd?.maxPriorityFeePerGas){
-      fee = { maxFeePerGas: fd.maxFeePerGas, maxPriorityFeePerGas: fd.maxPriorityFeePerGas };
-    }
-  }catch(_){}
-
-  if (fee){
-    return { ...(gasLimit? {gasLimit}:{}), ...fee }; // EIP-1559
-  }else{
-    // Legacy
-    const gasPrice = await providerWrite.getGasPrice().catch(()=> ethers.utils.parseUnits("50","gwei"));
-    return { ...(gasLimit? {gasLimit}:{}), type: 0, gasPrice };
-  }
-}
-
-/* -------------------- VIN/VND rate -------------------- */
+/* -------------------- VIN/VND (tuỳ chọn hiển thị) -------------------- */
 async function fetchVinToVND(){
   try{
     let vicVnd = 0;
@@ -174,13 +160,14 @@ async function fetchVinToVND(){
       }
     }
 
-    if (!(vinVND>0)) throw new Error("Không lấy được giá");
-
-    const ONE = ethers.BigNumber.from("1000000000000000000");
-    vinPerVNDWei = ONE.div(vinVND);
-    if (ONE.mod(vinVND).gt(0)) vinPerVNDWei = vinPerVNDWei.add(1);
-
-    $("#vinPrice")?.replaceChildren(`1 VIN = ${vinVND.toLocaleString("vi-VN")} VND`);
+    if (vinVND>0){
+      const ONE = ethers.BigNumber.from("1000000000000000000");
+      vinPerVNDWei = ONE.div(vinVND);
+      if (ONE.mod(vinVND).gt(0)) vinPerVNDWei = vinPerVNDWei.add(1);
+      $("#vinPrice")?.replaceChildren(`1 VIN = ${vinVND.toLocaleString("vi-VN")} VND`);
+    }else{
+      $("#vinPrice")?.replaceChildren("Đang tải giá…");
+    }
   }catch(e){
     console.error("fetchVinToVND", e);
     $("#vinPrice")?.replaceChildren("Đang tải giá…");
@@ -197,7 +184,6 @@ async function connectWallet(){
 
     signer = providerWrite.getSigner();
     account = (await signer.getAddress()).toLowerCase();
-
     initContractsForWrite();
 
     hide($("#btnConnect")); show($("#walletBox"));
@@ -308,18 +294,17 @@ $("#btnSearch")?.addEventListener("click", ()=>{
   });
 });
 
-/* -------------------- Registration -------------------- */
+/* -------------------- Đăng ký ví -------------------- */
 $("#btnRegister")?.addEventListener("click", async ()=>{
   if (!account){ toast("Hãy kết nối ví trước."); return; }
   try{
     const need = ethers.BigNumber.from(DEFAULTS.REG_FEE_WEI);
     const { MUABAN_ADDR } = readAddrs();
 
-    // allowance
+    // allowance VIN cho payRegistration
     const allow = await vinR.allowance(account, MUABAN_ADDR);
     if (allow.lt(need)){
-      const ovA = await buildOverrides("light", vin.estimateGas.approve(MUABAN_ADDR, need));
-      const txA = await vin.approve(MUABAN_ADDR, need, ovA);
+      const txA = await vin.approve(MUABAN_ADDR, need, highOverrides("light"));
       await txA.wait();
     }
 
@@ -328,9 +313,8 @@ $("#btnRegister")?.addEventListener("click", async ()=>{
     txData.from = account;
     await providerWrite.call(txData);
 
-    // send
-    const ov = await buildOverrides("med", muaban.estimateGas.payRegistration());
-    const tx = await muaban.payRegistration(ov);
+    // send (high gas)
+    const tx = await muaban.payRegistration(highOverrides("med"));
     await tx.wait();
 
     isRegistered = true;
@@ -339,7 +323,7 @@ $("#btnRegister")?.addEventListener("click", async ()=>{
   }catch(e){ toast(parseRevert(e)); }
 });
 
-/* -------------------- Create / Update product -------------------- */
+/* -------------------- Tạo / Cập nhật sản phẩm -------------------- */
 $("#btnCreate")?.addEventListener("click", ()=>{
   if (!isRegistered){ toast("Bạn chưa đăng ký ví."); return; }
   $("#createName").value=""; $("#createIPFS").value="";
@@ -349,7 +333,8 @@ $("#btnCreate")?.addEventListener("click", ()=>{
 });
 $(".modal#formCreate .close")?.addEventListener("click",()=> hide($("#formCreate")));
 
-$("#btnSubmitCreate")?.addEventListener("click", async ()=>{
+$("#btnSubmitCreate")?.addEventListener("click", submitCreate);
+async function submitCreate(){
   if (!account){ toast("Hãy kết nối ví."); return; }
   if (!isRegistered){ toast("Bạn chưa đăng ký ví."); return; }
   try{
@@ -362,36 +347,40 @@ $("#btnSubmitCreate")?.addEventListener("click", async ()=>{
 
     if (!name||!ipfs||!unit||!price||!wallet||!days){ toast("Vui lòng nhập đủ thông tin."); return; }
     if (!ethers.utils.isAddress(wallet)){ toast("Ví nhận thanh toán không hợp lệ."); return; }
-
     const descriptionCID = `unit:${unit}`;
     const imageCID = ipfs;
 
-    // simulate
-    const txData = await muaban.populateTransaction.createProduct(
-      name, descriptionCID, imageCID, ethers.BigNumber.from(String(price)), days, wallet, true
-    );
-    txData.from = account;
-    await providerWrite.call(txData);
+    // simulate -> nếu sai điều kiện sẽ báo reason, không mở MetaMask
+    try{
+      const txData = await muaban.populateTransaction.createProduct(
+        name, descriptionCID, imageCID,
+        ethers.BigNumber.from(String(price)), days, wallet, true
+      );
+      txData.from = account;
+      await providerWrite.call(txData);
+    }catch(simErr){
+      toast(parseRevert(simErr));
+      return;
+    }
 
-    // estimate + send (adaptive fee)
-    const ov = await buildOverrides("heavy",
-      muaban.estimateGas.createProduct(
-        name, descriptionCID, imageCID, ethers.BigNumber.from(String(price)), days, wallet, true
-      )
-    );
-    const tx = await muaban.createProduct(
-      name, descriptionCID, imageCID, ethers.BigNumber.from(String(price)), days, wallet, true, ov
-    );
-    await tx.wait();
+    // send với gas tối đa
+    try{
+      const tx = await muaban.createProduct(
+        name, descriptionCID, imageCID,
+        ethers.BigNumber.from(String(price)), days, wallet, true,
+        highOverrides("heavy")
+      );
+      await tx.wait();
+    }catch(sendErr){
+      showRpc(sendErr, "send.createProduct");
+      return;
+    }
 
     hide($("#formCreate"));
     toast("Đăng sản phẩm thành công.");
     await loadAllProducts();
-  }catch(e){ 
-    // Nếu vẫn thấy Metamask hiện "Internal JSON-RPC error", ta đã simulate ở trên; ở đây thường là do phí/limit.
-    showRpc(e, "createProduct.send"); 
-  }
-});
+  }catch(e){ showRpc(e, "submitCreate.catch"); }
+}
 
 function openUpdateForm(pid, p){
   $("#updatePid").value = String(pid);
@@ -410,7 +399,6 @@ $("#btnSubmitUpdate")?.addEventListener("click", async ()=>{
     const days  = Number($("#updateDays").value||0);
     const wallet= ($("#updateWallet").value||"").trim();
     const active= !!$("#updateActive").checked;
-
     if (!pid||!price||!days||!wallet){ toast("Vui lòng nhập đủ thông tin."); return; }
     if (!ethers.utils.isAddress(wallet)){ toast("Ví nhận thanh toán không hợp lệ."); return; }
 
@@ -421,12 +409,9 @@ $("#btnSubmitUpdate")?.addEventListener("click", async ()=>{
     txData.from = account;
     await providerWrite.call(txData);
 
-    // send (adaptive fee)
-    const ov = await buildOverrides("med",
-      muaban.estimateGas.updateProduct(pid, ethers.BigNumber.from(String(price)), days, wallet, active)
-    );
+    // send high gas
     const tx = await muaban.updateProduct(
-      pid, ethers.BigNumber.from(String(price)), days, wallet, active, ov
+      pid, ethers.BigNumber.from(String(price)), days, wallet, active, highOverrides("med")
     );
     await tx.wait();
 
@@ -436,7 +421,7 @@ $("#btnSubmitUpdate")?.addEventListener("click", async ()=>{
   }catch(e){ showRpc(e, "updateProduct.send"); }
 });
 
-/* -------------------- Buy & Orders (giữ nguyên) -------------------- */
+/* -------------------- Mua hàng & Đơn hàng (giữ như trước) -------------------- */
 function openBuyForm(pid, p){
   const m = $("#formBuy"); if (!m){ toast("Thiếu form mua hàng."); return; }
   m.dataset.pid = String(pid);
@@ -481,8 +466,7 @@ $("#btnSubmitBuy")?.addEventListener("click", async ()=>{
     const { MUABAN_ADDR } = readAddrs();
     const allow = await vinR.allowance(account, MUABAN_ADDR);
     if (allow.lt(totalVinWei)){
-      const ovA = await buildOverrides("light", vin.estimateGas.approve(MUABAN_ADDR, totalVinWei));
-      const txA = await vin.approve(MUABAN_ADDR, totalVinWei, ovA);
+      const txA = await vin.approve(MUABAN_ADDR, totalVinWei, highOverrides("light"));
       await txA.wait();
     }
 
@@ -492,10 +476,9 @@ $("#btnSubmitBuy")?.addEventListener("click", async ()=>{
     txData.from = account;
     await providerWrite.call(txData);
 
-    const ov = await buildOverrides("med",
-      muaban.estimateGas.placeOrder(pid, qty, vinPerVNDWei.toString(), buyerInfoCipher)
+    const tx = await muaban.placeOrder(
+      pid, qty, vinPerVNDWei.toString(), buyerInfoCipher, highOverrides("med")
     );
-    const tx = await muaban.placeOrder(pid, qty, vinPerVNDWei.toString(), buyerInfoCipher, ov);
     await tx.wait();
 
     hide($("#formBuy"));
@@ -560,8 +543,7 @@ async function confirmReceipt(oid){
     const txData = await muaban.populateTransaction.confirmReceipt(oid);
     txData.from = account;
     await providerWrite.call(txData);
-    const ov = await buildOverrides("light", muaban.estimateGas.confirmReceipt(oid));
-    const tx = await muaban.confirmReceipt(oid, ov);
+    const tx = await muaban.confirmReceipt(oid, highOverrides("light"));
     await tx.wait();
     toast("Đã xác nhận nhận hàng.");
     await loadMyOrders();
@@ -572,8 +554,7 @@ async function refundOrder(oid){
     const txData = await muaban.populateTransaction.refundIfExpired(oid);
     txData.from = account;
     await providerWrite.call(txData);
-    const ov = await buildOverrides("light", muaban.estimateGas.refundIfExpired(oid));
-    const tx = await muaban.refundIfExpired(oid, ov);
+    const tx = await muaban.refundIfExpired(oid, highOverrides("light"));
     await tx.wait();
     toast("Đã yêu cầu hoàn tiền.");
     await loadMyOrders();
