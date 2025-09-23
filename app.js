@@ -35,6 +35,22 @@ function toast(msg, type = "info") {
 function shortAddr(a) {
   return a ? `${a.slice(0, 6)}…${a.slice(-4)}` : "0x…";
 }
+// Thêm helper này vào đầu file (gần các tiện ích khác)
+function decodeRpcError(e) {
+  // Cố gắng lôi revert reason từ nhiều nơi khác nhau
+  const msg = e?.data?.message || e?.error?.message || e?.message || "";
+  if (msg) return msg;
+
+  // Một số provider trả về {data: {originalError: {data: '0x...', message:'...'}}}
+  const oerr = e?.data?.originalError || e?.error?.data || e?.data;
+  if (typeof oerr === "string") return oerr;
+  if (oerr && oerr.message) return oerr.message;
+  try {
+    return JSON.stringify(e);
+  } catch {
+    return "Unknown error";
+  }
+}
 
 // BigNumber helper (ethers v5)
 const { ethers } = window;
