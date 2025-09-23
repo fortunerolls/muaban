@@ -318,6 +318,16 @@ async function submitCreate() {
     const priceVNDStr = ($("#createPrice").value || "").trim().replace(/[,.\s]/g, "");
     const wallet = ($("#createWallet").value || "").trim();
     const days   = Number($("#createDays").value || 0);
+    async function submitCreate() {
+  try {
+    // ⬇️ BẮT BUỘC đứng trên Viction
+    if (window.ethereum) {
+      const cid = await window.ethereum.request({ method: "eth_chainId" });
+      if (cid !== VIC_CHAIN_ID_HEX) await ensureVictionAfterUnlock();
+    }
+
+    if (!state.registered) { toast("Bạn cần đăng ký trước khi đăng sản phẩm."); return; }
+    // ...
 
     // ----- Validate input kỹ hơn -----
     if (!name) { toast("Tên sản phẩm không được để trống."); return; }
