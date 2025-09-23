@@ -30,7 +30,7 @@ const VIC = {
   chainIdHex: '0x58',
   rpcUrls: ['https://rpc.viction.xyz'],
   explorer: 'https://vicscan.xyz',
-  name: 'Viction Mainnet',
+  name: 'Viction',
   native: { name:'VIC', symbol:'VIC', decimals:18 }
 };
 
