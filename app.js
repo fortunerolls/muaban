@@ -310,7 +310,18 @@ function closeModals() {
 
 async function submitCreate() {
   try {
-    if (!state.registered) { toast("Bạn cần đăng ký trước khi đăng sản phẩm."); return; }
+    // ⬇️ Đảm bảo đang đứng trên mạng Viction
+    if (window.ethereum) {
+      const cid = await window.ethereum.request({ method: "eth_chainId" });
+      if (cid !== VIC_CHAIN_ID_HEX) {
+        await ensureVictionAfterUnlock();
+      }
+    }
+
+    if (!state.registered) { 
+      toast("Bạn cần đăng ký trước khi đăng sản phẩm."); 
+      return; 
+    }
 
     const name   = ($("#createName").value || "").trim();
     const ipfs   = ($("#createIPFS").value || "").trim();
@@ -318,18 +329,8 @@ async function submitCreate() {
     const priceVNDStr = ($("#createPrice").value || "").trim().replace(/[,.\s]/g, "");
     const wallet = ($("#createWallet").value || "").trim();
     const days   = Number($("#createDays").value || 0);
-    async function submitCreate() {
-  try {
-    // ⬇️ BẮT BUỘC đứng trên Viction
-    if (window.ethereum) {
-      const cid = await window.ethereum.request({ method: "eth_chainId" });
-      if (cid !== VIC_CHAIN_ID_HEX) await ensureVictionAfterUnlock();
-    }
 
-    if (!state.registered) { toast("Bạn cần đăng ký trước khi đăng sản phẩm."); return; }
-    // ...
-
-    // ----- Validate input kỹ hơn -----
+    // ----- Validate input -----
     if (!name) { toast("Tên sản phẩm không được để trống."); return; }
     if (!ipfs) { toast("Vui lòng nhập IPFS CID của hình/video."); return; }
     if (!unit) { toast("Vui lòng nhập đơn vị bán (ví dụ: cái, hộp…)."); return; }
@@ -351,30 +352,33 @@ async function submitCreate() {
     const imageCID = ipfs;
     const active = true;
 
-    // ----- Pre-flight: callStatic để bắt revert reason rõ ràng -----
+    // ----- Pre-flight: callStatic để bắt revert reason -----
     try {
       await muaban.callStatic.createProduct(
         name, descriptionCID, imageCID, priceVND, days, wallet, active
       );
     } catch (simErr) {
       const reason = decodeRpcError(simErr);
-      // Bóc tách vài thông điệp thường gặp để hiển thị thân thiện
-      if (reason.includes("NOT_REGISTERED"))  toast("Ví của bạn chưa đăng ký. Vui lòng bấm 'Đăng ký' (0.001 VIN).", "error");
-      else if (reason.includes("PRICE_REQUIRED"))  toast("Giá VND phải > 0.", "error");
-      else if (reason.includes("DELIVERY_REQUIRED"))  toast("Số ngày giao tối đa phải > 0.", "error");
-      else if (reason.includes("PAYOUT_WALLET_ZERO")) toast("Địa chỉ ví nhận tiền không hợp lệ.", "error");
-      else toast(`Đăng sản phẩm bị từ chối: ${reason}`, "error");
-      return; // Không gửi tx khi mô phỏng đã fail
+      if (reason.includes("NOT_REGISTERED"))  
+        toast("Ví của bạn chưa đăng ký. Vui lòng bấm 'Đăng ký' (0.001 VIN).", "error");
+      else if (reason.includes("PRICE_REQUIRED"))  
+        toast("Giá VND phải > 0.", "error");
+      else if (reason.includes("DELIVERY_REQUIRED"))  
+        toast("Số ngày giao tối đa phải > 0.", "error");
+      else if (reason.includes("PAYOUT_WALLET_ZERO")) 
+        toast("Địa chỉ ví nhận tiền không hợp lệ.", "error");
+      else 
+        toast(`Đăng sản phẩm bị từ chối: ${reason}`, "error");
+      return;
     }
 
-    // ----- Ước lượng gas rồi gửi thật -----
+    // ----- Ước lượng gas và gửi tx -----
     let gas;
     try {
       gas = await muaban.estimateGas.createProduct(
         name, descriptionCID, imageCID, priceVND, days, wallet, active
       );
     } catch (egErr) {
-      // Nếu ước lượng gas cũng fail, hiển thị lỗi chi tiết và dừng
       const reason = decodeRpcError(egErr);
       toast(`Không ước lượng được gas: ${reason}`, "error");
       return;
