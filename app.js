@@ -315,43 +315,73 @@ async function submitCreate() {
     const name   = ($("#createName").value || "").trim();
     const ipfs   = ($("#createIPFS").value || "").trim();
     const unit   = ($("#createUnit").value || "").trim();
-    const priceVNDNum = Math.max(1, Number($("#createPrice").value || 0));
-    const priceVND = ethers.BigNumber.from(String(priceVNDNum));
+    const priceVNDStr = ($("#createPrice").value || "").trim().replace(/[,.\s]/g, "");
     const wallet = ($("#createWallet").value || "").trim();
     const days   = Number($("#createDays").value || 0);
 
-    if (!name || !ipfs || !unit || !priceVND || !wallet || !days) {
-      toast("Vui lòng nhập đủ thông tin."); return;
+    // ----- Validate input kỹ hơn -----
+    if (!name) { toast("Tên sản phẩm không được để trống."); return; }
+    if (!ipfs) { toast("Vui lòng nhập IPFS CID của hình/video."); return; }
+    if (!unit) { toast("Vui lòng nhập đơn vị bán (ví dụ: cái, hộp…)."); return; }
+
+    if (!priceVNDStr || !/^\d+$/.test(priceVNDStr)) {
+      toast("Giá VND phải là số nguyên dương (không chứa dấu phẩy/chấm)."); return;
+    }
+    const priceVND = ethers.BigNumber.from(priceVNDStr);
+    if (priceVND.lte(0)) { toast("Giá VND phải > 0."); return; }
+
+    if (!ethers.utils.isAddress(wallet) || wallet === ethers.constants.AddressZero) {
+      toast("Địa chỉ ví nhận tiền (payout) không hợp lệ."); return;
+    }
+    if (!Number.isFinite(days) || days <= 0 || days > 3650) {
+      toast("Số ngày giao tối đa phải trong khoảng 1…3650."); return;
     }
 
     const descriptionCID = `unit:${unit}`;
     const imageCID = ipfs;
     const active = true;
 
-    // Ước lượng gas
+    // ----- Pre-flight: callStatic để bắt revert reason rõ ràng -----
+    try {
+      await muaban.callStatic.createProduct(
+        name, descriptionCID, imageCID, priceVND, days, wallet, active
+      );
+    } catch (simErr) {
+      const reason = decodeRpcError(simErr);
+      // Bóc tách vài thông điệp thường gặp để hiển thị thân thiện
+      if (reason.includes("NOT_REGISTERED"))  toast("Ví của bạn chưa đăng ký. Vui lòng bấm 'Đăng ký' (0.001 VIN).", "error");
+      else if (reason.includes("PRICE_REQUIRED"))  toast("Giá VND phải > 0.", "error");
+      else if (reason.includes("DELIVERY_REQUIRED"))  toast("Số ngày giao tối đa phải > 0.", "error");
+      else if (reason.includes("PAYOUT_WALLET_ZERO")) toast("Địa chỉ ví nhận tiền không hợp lệ.", "error");
+      else toast(`Đăng sản phẩm bị từ chối: ${reason}`, "error");
+      return; // Không gửi tx khi mô phỏng đã fail
+    }
+
+    // ----- Ước lượng gas rồi gửi thật -----
     let gas;
     try {
       gas = await muaban.estimateGas.createProduct(
         name, descriptionCID, imageCID, priceVND, days, wallet, active
       );
-    } catch {
-      gas = ethers.BigNumber.from(600000);
+    } catch (egErr) {
+      // Nếu ước lượng gas cũng fail, hiển thị lỗi chi tiết và dừng
+      const reason = decodeRpcError(egErr);
+      toast(`Không ước lượng được gas: ${reason}`, "error");
+      return;
     }
 
     const tx = await muaban.createProduct(
       name, descriptionCID, imageCID, priceVND, days, wallet, active,
-      { gasLimit: gas.mul(13).div(10) }
+      { gasLimit: gas.mul(13).div(10) } // +30% buffer
     );
     await tx.wait();
 
     toast("Đăng sản phẩm thành công!");
     closeModals();
-
-    // làm mới danh sách
     await loadProducts(true);
   } catch (e) {
     console.error("submitCreate error:", e);
-    toast(`Lỗi khi đăng sản phẩm: ${e?.data?.message || e?.error?.message || e?.message || "Internal JSON-RPC error."}`, "error");
+    toast(`Lỗi khi đăng sản phẩm: ${decodeRpcError(e) || "Internal JSON-RPC error."}`, "error");
   }
 }
 
