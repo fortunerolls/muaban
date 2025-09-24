@@ -1,11 +1,10 @@
 /* ====================================================================
    muaban.vin — app.js (ethers v5)
-   Mục tiêu:
-   - Dứt điểm "Internal JSON-RPC error" khi Đăng sản phẩm/Đặt hàng
-   - KHÔNG set `type`; để RPC tự chọn legacy, chỉ set gasPrice + gasLimit
-   - Ước lượng gas động (estimateGas) + đệm 40% cho mọi giao dịch
-   - Preflight simulate (provider.call) để hiện reason rõ ràng
-   - Khớp HTML IDs trong index.html & ABI trong *.json
+   Fix triệt để “Internal JSON-RPC error” khi gửi tx:
+   - Ước lượng gas động (estimateGas) + đệm 40%
+   - KHÔNG set type/chainId trong overrides (tránh RPC -32603)
+   - Kiểm tra đủ VIC trả gas trước khi gửi
+   - Preflight (eth_call) để thấy reason rõ ràng
 ==================================================================== */
 
 /* -------------------- DOM helpers -------------------- */
@@ -25,9 +24,10 @@ const CFG = {
   MUABAN_ADDR: "0x190FD18820498872354eED9C4C080cB365Cd12E0",
   VIN_ADDR:    "0x941F63807401efCE8afe3C9d88d368bAA287Fac4",
 
-  GAS_PRICE_GWEI: "50", // tăng 100–200 nếu mạng bận
+  // gas price tối thiểu nếu getGasPrice lỗi
+  GAS_PRICE_GWEI_FALLBACK: "50",
 
-  // Nguồn tỉ giá
+  // Nguồn tỷ giá VIN/VND
   COINGECKO_VIC_VND: "https://api.coingecko.com/api/v3/simple/price?ids=viction&vs_currencies=vnd",
   COINGECKO_VIC_USD: "https://api.coingecko.com/api/v3/simple/price?ids=viction&vs_currencies=usd",
   COINGECKO_USD_VND: "https://api.coingecko.com/api/v3/simple/price?ids=tether&vs_currencies=vnd",
@@ -164,22 +164,32 @@ async function ensureViction(){
   }
 }
 
-/* -------------------- Legacy-like overrides (KHÔNG set type) -------------------- */
-async function estimateOv(estimator, args = []){
-  let gasPrice;
+/* -------------------- Gas/Override helpers -------------------- */
+// Lấy gasPrice an toàn
+async function getSafeGasPrice(){
   try{
-    gasPrice = await providerWrite.getGasPrice();
+    const gp = await providerWrite.getGasPrice();
+    // nếu RPC trả quá thấp, dùng max(gp, fallback)
+    const min = ethers.utils.parseUnits(CFG.GAS_PRICE_GWEI_FALLBACK, "gwei");
+    return gp.lt(min) ? min : gp;
   }catch(_){
-    gasPrice = ethers.utils.parseUnits(CFG.GAS_PRICE_GWEI, "gwei");
+    return ethers.utils.parseUnits(CFG.GAS_PRICE_GWEI_FALLBACK, "gwei");
   }
+}
+// Ước lượng gas + đệm 40%, KHÔNG set type/chainId
+async function buildOv(estimator, args = []){
+  const gasPrice = await getSafeGasPrice();
   const est = await estimator(...args);
-  const pad = est.mul(140).div(100); // +40%
-  return {
-    gasPrice,
-    gasLimit: pad,
-    chainId: CFG.CHAIN_ID_DEC
-    // KHÔNG set `type`; để RPC tự xử lý (phần lớn sẽ là legacy)
-  };
+  const gasLimit = est.mul(140).div(100); // +40%
+  return { gasPrice, gasLimit };
+}
+// Kiểm tra đủ VIC trả gas trước khi gửi
+async function assertHasGasBudget(ov){
+  const bal = await providerWrite.getBalance(account);
+  const fee = ov.gasPrice.mul(ov.gasLimit);
+  if (bal.lt(fee)){
+    throw new Error(`Insufficient VIC for gas. Need ≈ ${ethers.utils.formatEther(fee)} VIC, balance = ${ethers.utils.formatEther(bal)} VIC`);
+  }
 }
 
 /* -------------------- Tỷ giá VIN/VND -------------------- */
@@ -214,7 +224,6 @@ async function fetchVinToVND(){
     }
     if (!(vinVND>0)) throw new Error("Không lấy được giá");
 
-    // Tính vinPerVND theo decimals thực tế của VIN
     const ONE = ethers.BigNumber.from(10).pow(vinDecimals);
     vinPerVNDWei = ONE.div(vinVND);
     if (ONE.mod(vinVND).gt(0)) vinPerVNDWei = vinPerVNDWei.add(1); // ceil
@@ -239,9 +248,8 @@ async function connectWallet(){
     initContractsForWrite();
 
     // decimals VIN (an toàn)
-    try { vinDecimals = await vin.decimals(); } catch(_){
-      try { vinDecimals = await muabanR.vinDecimals(); } catch(_){}
-    }
+    try { vinDecimals = await (new ethers.Contract(CFG.VIN_ADDR, VIN_ABI, providerRead)).decimals(); }
+    catch(_){ try { vinDecimals = await muabanR.vinDecimals(); } catch(_){} }
 
     const [vinBal, vicBal, reg] = await Promise.all([
       vinR.balanceOf(account),
@@ -299,7 +307,8 @@ $("#btnRegister")?.addEventListener("click", async ()=>{
     // ensure allowance
     const allow = await vin.allowance(account, CFG.MUABAN_ADDR);
     if (allow.lt(regFee)){
-      const ovA = await estimateOv(vin.estimateGas.approve, [CFG.MUABAN_ADDR, regFee]);
+      const ovA = await buildOv(vin.estimateGas.approve, [CFG.MUABAN_ADDR, regFee]);
+      await assertHasGasBudget(ovA);
       const txA = await vin.approve(CFG.MUABAN_ADDR, regFee, ovA);
       await txA.wait();
     }
@@ -310,7 +319,8 @@ $("#btnRegister")?.addEventListener("click", async ()=>{
     await providerWrite.call(callData);
 
     // send
-    const ov = await estimateOv(muaban.estimateGas.payRegistration, []);
+    const ov = await buildOv(muaban.estimateGas.payRegistration, []);
+    await assertHasGasBudget(ov);
     const tx = await muaban.payRegistration(ov);
     await tx.wait();
 
@@ -424,16 +434,17 @@ $("#btnSubmitCreate")?.addEventListener("click", async ()=>{
   const descCID = `unit:${unit||""}`;
   try{
     // preflight
-    const txData = await muaban.populateTransaction.createProduct(
+    const callData = await muaban.populateTransaction.createProduct(
       name, descCID, imgCID, ethers.BigNumber.from(priceVND),
       days, payout, true
     );
-    txData.from = account;
-    await providerWrite.call(txData);
+    callData.from = account;
+    await providerWrite.call(callData);
 
-    // send (estimate + pad + no type)
+    // send (estimate + pad + kiểm tra gas)
     const args = [name, descCID, imgCID, ethers.BigNumber.from(priceVND), days, payout, true];
-    const ov   = await estimateOv(muaban.estimateGas.createProduct, args);
+    const ov   = await buildOv(muaban.estimateGas.createProduct, args);
+    await assertHasGasBudget(ov);
     const tx   = await muaban.createProduct(...args, ov);
     await tx.wait();
 
@@ -475,7 +486,8 @@ $("#btnSubmitUpdate")?.addEventListener("click", async ()=>{
     await providerWrite.call(callData);
 
     const args = [pid, ethers.BigNumber.from(price), days, payout, active];
-    const ov   = await estimateOv(muaban.estimateGas.updateProduct, args);
+    const ov   = await buildOv(muaban.estimateGas.updateProduct, args);
+    await assertHasGasBudget(ov);
     const tx   = await muaban.updateProduct(...args, ov);
     await tx.wait();
 
@@ -550,22 +562,22 @@ $("#btnSubmitBuy")?.addEventListener("click", async ()=>{
     // Ước lượng VIN cần để approve
     const prod = await muabanR.getProduct(pid);
     const totalVND = ethers.BigNumber.from(prod.priceVND).mul(qty);
-    const ONE = ethers.BigNumber.from(10).pow(vinDecimals);
-    // totalVIN(wei) ≈ totalVND * vinPerVNDWei
-    const estVinWei = totalVND.mul(vinPerVNDWei);
+    const estVinWei = totalVND.mul(vinPerVNDWei); // wei
     const approveNeeded = estVinWei.mul(101).div(100); // +1%
 
     // ensure allowance
     const allow = await vin.allowance(account, CFG.MUABAN_ADDR);
     if (allow.lt(approveNeeded)){
-      const ovA = await estimateOv(vin.estimateGas.approve, [CFG.MUABAN_ADDR, approveNeeded]);
+      const ovA = await buildOv(vin.estimateGas.approve, [CFG.MUABAN_ADDR, approveNeeded]);
+      await assertHasGasBudget(ovA);
       const txA = await vin.approve(CFG.MUABAN_ADDR, approveNeeded, ovA);
       await txA.wait();
     }
 
     // send placeOrder
     const args = [pid, qty, vinPerVNDWei, cipher];
-    const ov   = await estimateOv(muaban.estimateGas.placeOrder, args);
+    const ov   = await buildOv(muaban.estimateGas.placeOrder, args);
+    await assertHasGasBudget(ov);
     const tx   = await muaban.placeOrder(...args, ov);
     await tx.wait();
 
@@ -640,7 +652,8 @@ async function confirmReceipt(oid){
     callData.from = account;
     await providerWrite.call(callData);
 
-    const ov = await estimateOv(muaban.estimateGas.confirmReceipt, [oid]);
+    const ov = await buildOv(muaban.estimateGas.confirmReceipt, [oid]);
+    await assertHasGasBudget(ov);
     const tx = await muaban.confirmReceipt(oid, ov);
     await tx.wait();
 
@@ -656,7 +669,8 @@ async function refundIfExpired(oid){
     callData.from = account;
     await providerWrite.call(callData);
 
-    const ov = await estimateOv(muaban.estimateGas.refundIfExpired, [oid]);
+    const ov = await buildOv(muaban.estimateGas.refundIfExpired, [oid]);
+    await assertHasGasBudget(ov);
     const tx = await muaban.refundIfExpired(oid, ov);
     await tx.wait();
 
@@ -677,8 +691,7 @@ $("#btnOrdersSell")?.addEventListener("click", ()=>{ show($("#ordersSellSection"
     await loadAbis();
     initProviders();
     initContractsForRead();
-    // Lấy decimals VIN trước khi tính tỷ giá
-    try { 
+    try { // lấy decimals VIN trước khi tính tỷ giá
       const vinTmp = new ethers.Contract(CFG.VIN_ADDR, VIN_ABI, providerRead);
       vinDecimals = await vinTmp.decimals();
     } catch(_) {
