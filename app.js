@@ -1,378 +1,713 @@
+/* ====================================================================
+   muaban.vin — app.js (ethers v5)
+   MỤC TIÊU: sửa lỗi "Internal JSON-RPC error" khi ký giao dịch & ổn định UI
+   - ÉP GIAO DỊCH LEGACY (type 0) dùng gasPrice; KHÔNG gửi EIP-1559 trên VIC
+   - Preflight mọi giao dịch (populateTransaction + provider.call({from}))
+     để bắt revert rõ ràng (NOT_REGISTERED, PRICE_REQUIRED, ...)
+   - Tỷ giá VIN/VND: lấy từ nhiều nguồn; có thể override qua <body data-vin-vnd>
+   - Bám sát HTML (index.html) & ABI (Muaban_ABI.json, VinToken_ABI.json)
+==================================================================== */
 
-/* ======================= Muaban.vin - app.js (full rewrite v2) =======================
- * Fix: remove literal placeholders showing in UI by building DOM nodes (no unsafe templates)
- * Network: Viction Mainnet (88) | RPC: https://rpc.viction.xyz | Explorer: https://vicscan.xyz
- * ================================================================================ */
-(function(){ 'use strict';
+/* -------------------- DOM helpers -------------------- */
+const $  = (q)=>document.querySelector(q);
+const $$ = (q)=>document.querySelectorAll(q);
+const show = el=>{ if(!el) return; el.classList.remove('hidden'); };
+const hide = el=>{ if(!el) return; el.classList.add('hidden'); };
+const short=(a)=>a?`${a.slice(0,6)}…${a.slice(-4)}`: "";
+const toast=(m)=>alert(m);
 
-// --------------------------- DOM helpers ---------------------------
-const $  = (sel) => document.querySelector(sel);
-const $$ = (sel) => Array.from(document.querySelectorAll(sel));
-function el(tag, cls){ const x = document.createElement(tag); if (cls) x.className = cls; return x; }
-function shortAddr(a){ return a ? a.slice(0,6)+'…'+a.slice(-4) : ''; }
-function toast(msg){ try{ console.log('[toast]', msg); }catch{} alert(msg); }
-
-// --------------------------- Constants -----------------------------
-const VIC = {
-  chainIdDec: 88,
-  chainIdHex: '0x58',
-  rpcUrls: ['https://rpc.viction.xyz'],
-  explorer: 'https://vicscan.xyz',
-  name: 'Viction Mainnet',
-  native: { name:'VIC', symbol:'VIC', decimals:18 }
+/* -------------------- Cấu hình -------------------- */
+const DEFAULTS = {
+  CHAIN_ID: 88,
+  RPC_URL: "https://rpc.viction.xyz",
+  EXPLORER: "https://vicscan.xyz",
+  // Địa chỉ mặc định (có thể override qua <body data-*>):
+  MUABAN_ADDR: "0x190FD18820498872354eED9C4C080cB365Cd12E0",
+  VIN_ADDR:    "0x941F63807401efCE8afe3C9d88d368bAA287Fac4",
+  // Phí đăng ký 0.001 VIN (18 decimals)
+  REG_FEE_WEI: "1000000000000000",
+  // Nguồn tỷ giá (đa nguồn để tránh lỗi CORS / rate-limit)
+  COINGECKO_VIC_VND: "https://api.coingecko.com/api/v3/simple/price?ids=viction&vs_currencies=vnd",
+  COINGECKO_USD_VND:  "https://api.coingecko.com/api/v3/simple/price?ids=tether&vs_currencies=vnd",
+  COINGECKO_VIC_USD:  "https://api.coingecko.com/api/v3/simple/price?ids=viction&vs_currencies=usd",
+  BINANCE_VICUSDT:    "https://api.binance.com/api/v3/ticker/price?symbol=VICUSDT", // có thể không luôn khả dụng
 };
-const CONTRACTS = { MUABAN: '0x190FD18820498872354eED9C4C080cB365Cd12E0', VIN: '0x941F63807401efCE8afe3C9d88d368bAA287Fac4' };
-const GAS = { gasPriceGwei: '50', light: 250000, med: 600000, heavy: 1000000 };
 
-let MUABAN_ABI = null, VIN_ABI = null;
-let provider, signer, account, muaban, vin;
+/* ---- GAS/FEES: ép legacy (gasPrice), không dùng EIP-1559 ---- */
+const GAS_LIMIT_LIGHT = ethers.BigNumber.from("200000");   // approve / confirm / refund
+const GAS_LIMIT_MED   = ethers.BigNumber.from("400000");   // payRegistration / updateProduct / placeOrder
+const GAS_LIMIT_HEAVY = ethers.BigNumber.from("800000");   // createProduct
+const LEGACY_GAS_PRICE_GWEI = "50"; // tăng 100–200 nếu cần
 
-// ----------------------- Provider / Wallet -------------------------
-function getEthereum(){
-  const eth = window.ethereum;
-  if (!eth) return null;
-  if (Array.isArray(eth.providers)){
-    const mm = eth.providers.find(p => p.isMetaMask);
-    return mm || eth.providers[0];
-  }
-  return eth;
-}
-function normChainId(chainId){
-  if (typeof chainId === 'string'){ const hex = chainId.toLowerCase(); return { dec: parseInt(hex,16), hex }; }
-  if (typeof chainId === 'number'){ return { dec: chainId, hex: '0x'+chainId.toString(16) }; }
-  return { dec: NaN, hex: '' };
-}
-async function ensureVIC(eth){
-  const { dec } = normChainId(await eth.request({ method: 'eth_chainId' }));
-  if (dec === VIC.chainIdDec) return true;
+/* -------------------- State -------------------- */
+let providerRead, providerWrite, signer, account;
+let MUABAN_ABI, VIN_ABI;
+let muaban, vin;            // viết
+let isRegistered = false;
+
+let vinPerVNDWei = ethers.BigNumber.from(0); // VIN wei cho 1 VND (ceil)
+let vinVND = 0;                               // 1 VIN = ? VND (floor)
+let productsCache = [];
+let ordersBuyer = [];
+let ordersSeller = [];
+
+/* -------------------- Utils -------------------- */
+function parseRevert(err){
+  const raw = err?.error?.message || err?.data?.message || err?.reason || err?.message || "";
+  const map = {
+    NOT_REGISTERED: "Ví này chưa đăng ký. Hãy bấm ‘Đăng ký’ trước.",
+    ALREADY_REGISTERED: "Ví đã đăng ký.",
+    PRICE_REQUIRED: "Giá bán (VND) phải > 0.",
+    DELIVERY_REQUIRED: "Thời gian giao hàng (ngày) phải ≥ 1.",
+    PAYOUT_WALLET_ZERO: "Ví nhận thanh toán không được để trống.",
+    NOT_SELLER: "Bạn không phải người bán của sản phẩm này.",
+    PRODUCT_NOT_ACTIVE: "Sản phẩm đang tắt bán.",
+    PRODUCT_NOT_FOUND: "Không tìm thấy sản phẩm.",
+    QUANTITY_REQUIRED: "Số lượng phải ≥ 1.",
+    VIN_PER_VND_REQUIRED: "Tỷ giá chưa sẵn sàng. Vui lòng thử lại.",
+    VIN_TRANSFER_FAIL: "Chuyển VIN thất bại (kiểm tra số dư/allowance).",
+    NOT_PLACED: "Trạng thái đơn không hợp lệ.",
+    NOT_BUYER: "Chỉ người mua mới thực hiện được thao tác này.",
+    NOT_EXPIRED: "Đơn chưa quá hạn giao hàng."
+  };
+  for (const k in map) if (raw.includes(k)) return map[k];
+  const m = /execution reverted(?: with reason string)?:\s*([^\n]+)/i.exec(raw);
+  if (m) return m[1];
   try{
-    await eth.request({ method: 'wallet_switchEthereumChain', params: [{ chainId: VIC.chainIdHex }] });
-    return true;
-  }catch(err){
-    if (err && (err.code === 4902 || String(err.message||'').includes('Unrecognized chain ID'))){
-      await eth.request({ method: 'wallet_addEthereumChain', params: [{
-        chainId: VIC.chainIdHex, chainName: VIC.name, nativeCurrency: VIC.native,
-        rpcUrls: VIC.rpcUrls, blockExplorerUrls: [VIC.explorer]
-      }]});
-      return true;
+    const data = err?.error?.data || err?.data;
+    if (typeof data === "string" && data.startsWith("0x") && data.length >= 10){
+      const iface = new ethers.utils.Interface(["function Error(string)"]);
+      const reason = iface.parseError(data)?.args?.[0];
+      if (reason) return String(reason);
     }
-    throw err;
-  }
-}
-function legacyOverrides(weight='light'){
-  const gas = weight==='heavy'?GAS.heavy : weight==='med'?GAS.med : GAS.light;
-  return { type: 0, gasPrice: ethers.utils.parseUnits(GAS.gasPriceGwei, 'gwei'), gasLimit: gas };
-}
-async function loadABIs(){
-  if (!MUABAN_ABI) MUABAN_ABI = await fetch('Muaban_ABI.json', {cache:'no-store'}).then(r=>r.json());
-  if (!VIN_ABI)    VIN_ABI    = await fetch('VinToken_ABI.json', {cache:'no-store'}).then(r=>r.json());
-}
-async function initContracts(){
-  await loadABIs();
-  muaban = new ethers.Contract(CONTRACTS.MUABAN, MUABAN_ABI, signer || provider);
-  vin    = new ethers.Contract(CONTRACTS.VIN,    VIN_ABI,    signer || provider);
-}
-async function connectWallet(){
-  const eth = getEthereum();
-  if (!eth){ toast('Không tìm thấy ví (MetaMask).'); return; }
-  await ensureVIC(eth);
-  provider = new ethers.providers.Web3Provider(eth, 'any');
-  const accs = await eth.request({ method: 'eth_requestAccounts' });
-  account = accs && accs[0] || null;
-  signer  = provider.getSigner();
-  const { dec } = normChainId(await eth.request({ method:'eth_chainId' }));
-  if (dec !== VIC.chainIdDec){ await ensureVIC(eth); }
-  eth.removeAllListeners && eth.removeAllListeners('chainChanged');
-  eth.removeAllListeners && eth.removeAllListeners('accountsChanged');
-  eth.on('chainChanged', async (hex)=>{
-    const { dec } = normChainId(hex);
-    if (dec !== VIC.chainIdDec){ try{ await ensureVIC(eth); }catch(e){} }
-    provider = new ethers.providers.Web3Provider(eth, 'any'); signer = provider.getSigner();
-    await afterWalletReady();
-  });
-  eth.on('accountsChanged', async (accs)=>{
-    account = (accs && accs[0]) || null; signer = provider.getSigner();
-    await afterWalletReady();
-  });
-  await afterWalletReady();
+  }catch(_){}
+  return raw || "Giao dịch bị từ chối hoặc dữ liệu không hợp lệ.";
 }
 
-// ----------------------- Price Feed (VIN/VND) -----------------------
-let lastPrice = { vic_usdt: 0, usdt_vnd: 0, vin_vnd: 0, vin_per_vnd_wei: ethers.constants.Zero };
-async function fetchPrices(){
+// Popup chi tiết RPC (tiện debug trên mobile)
+function showRpc(err, tag="RPC"){
   try{
-    const [vicRes, usdRes] = await Promise.all([
-      fetch('https://api.binance.com/api/v3/ticker/price?symbol=VICUSDT', {cache:'no-store'}),
-      fetch('https://api.coingecko.com/api/v3/simple/price?ids=tether&vs_currencies=vnd', {cache:'no-store'})
-    ]);
-    const vicJson = await vicRes.json(); const usdJson = await usdRes.json();
-    const vic_usdt = parseFloat(vicJson?.price || '0');
-    const usdt_vnd = parseFloat(usdJson?.tether?.vnd || '0');
-    if (vic_usdt>0 && usdt_vnd>0){
-      const vin_vnd = vic_usdt * 100 * usdt_vnd;
-      const ONE = ethers.BigNumber.from('1000000000000000000');
-      const vin_per_vnd_wei = ONE.div(Math.max(1, Math.floor(vin_vnd)));
-      lastPrice = { vic_usdt, usdt_vnd, vin_vnd, vin_per_vnd_wei };
-      const el = $('#vinPrice'); if (el) el.textContent = '1 VIN ≈ ' + new Intl.NumberFormat('vi-VN').format(Math.round(vin_vnd)) + ' VND';
-    }
-  }catch(e){ console.warn('[price] fetch error', e); }
-}
-
-// -------------------- Revert reason parsing -------------------------
-function parseRevert(data){
-  try{
-    if (!data || typeof data !== 'string') return null;
-    if (data.startsWith('0x08c379a0')){
-      const iface = new ethers.utils.Interface(['function Error(string)']);
-      return String(iface.decodeFunctionData('Error', data)[0]);
-    }
-    if (data.startsWith('0x4e487b71')){
-      return 'Panic(' + ethers.BigNumber.from('0x'+data.slice(10)).toString() + ')';
-    }
-  }catch{}
-  return null;
-}
-async function simulate(txReq){
-  try{ if (!txReq.from) txReq.from = account; await provider.call(txReq); return null; }
-  catch(e){
-    const data = e?.data || e?.error?.data || e?.error?.message || '';
-    const reason = typeof data === 'string' ? parseRevert(data) : null;
-    return reason || 'SIMULATE_REVERT';
+    const obj = {
+      tag,
+      code: err?.code,
+      message: err?.message || err?.error?.message,
+      data: err?.data || err?.error?.data,
+      reason: err?.reason,
+    };
+    console.error(tag, obj);
+    alert(`${tag}\n${JSON.stringify(obj, null, 2)}`);
+  }catch(_){
+    console.error(tag, err);
+    alert(`${tag}: ${String(err)}`);
   }
 }
 
-// --------------------------- UI Binding -----------------------------
-async function afterWalletReady(){
-  await loadABIs(); await initContracts(); await refreshBalances(); await refreshRegistered();
-  await loadAllProducts(); setupMenuVisibility();
+// Chuẩn hoá VND: "1.200.000" / "1,200,000" / "1200000"
+function parseVND(input){
+  const digits = String(input||"").trim().replace(/[^\d]/g, "");
+  if (!digits) return NaN;
+  const n = Number(digits);
+  return Number.isFinite(n) ? n : NaN;
 }
-async function refreshBalances(){
-  if (!account || !provider) return;
-  try{
-    const [vicBal, vinBal] = await Promise.all([ provider.getBalance(account), vin.balanceOf(account) ]);
-    $('#vicBalance').textContent = 'VIC: ' + parseFloat(ethers.utils.formatEther(vicBal)).toFixed(4);
-    $('#vinBalance').textContent = 'VIN: ' + Number(ethers.utils.formatUnits(vinBal, 18)).toFixed(4);
-    const a = $('#accountShort'); if (a){ a.textContent = shortAddr(account); a.href = VIC.explorer + '/address/' + account; }
-    $('#walletBox')?.classList.remove('hidden'); $('#btnConnect')?.classList.add('hidden');
-  }catch(e){ console.warn('refreshBalances', e); }
+
+function ipfsToHttp(link){
+  if (!link) return "";
+  if (link.startsWith("ipfs://")) return "https://ipfs.io/ipfs/" + link.replace("ipfs://", "");
+  return link;
 }
-async function refreshRegistered(){
-  if (!account || !muaban) return;
-  let reg=false; try{ reg = await muaban.registered(account); }catch{}
-  if (reg){
-    $('#btnRegister')?.classList.add('hidden'); $('#btnCreate')?.classList.remove('hidden');
-    $('#btnOrdersBuy')?.classList.remove('hidden'); $('#btnOrdersSell')?.classList.remove('hidden');
-  }else{
-    $('#btnRegister')?.classList.remove('hidden'); $('#btnCreate')?.classList.add('hidden');
-    $('#btnOrdersBuy')?.classList.add('hidden'); $('#btnOrdersSell')?.classList.add('hidden');
+function parseUnitFromCID(desc){
+  if (!desc) return "";
+  const m = /^unit:(.+)$/i.exec(desc.trim());
+  return m ? m[1].trim() : "";
+}
+function escapeHtml(str){
+  return String(str).replace(/[&<>"']/g, s=>({ "&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#039;" }[s] || s));
+}
+function statusText(code){
+  const m = {0:"-",1:"Đang xử lý",2:"Đã giải ngân",3:"Đã hoàn tiền"};
+  return m[Number(code)] || "-";
+}
+
+/* -------------------- Providers & Contracts -------------------- */
+function initProviders(){
+  providerRead = new ethers.providers.JsonRpcProvider(DEFAULTS.RPC_URL);
+  if (window.ethereum){
+    providerWrite = new ethers.providers.Web3Provider(window.ethereum);
   }
-  $('#menuBox')?.classList.remove('hidden');
+}
+function initContractsForRead(){
+  const muabanR = new ethers.Contract(DEFAULTS.MUABAN_ADDR, MUABAN_ABI, providerRead);
+  const vinR    = new ethers.Contract(DEFAULTS.VIN_ADDR,    VIN_ABI,    providerRead);
+  return { muabanR, vinR };
+}
+function initContractsForWrite(){
+  muaban = new ethers.Contract(DEFAULTS.MUABAN_ADDR, MUABAN_ABI, signer);
+  vin    = new ethers.Contract(DEFAULTS.VIN_ADDR,    VIN_ABI,    signer);
+  return { muaban, vin };
 }
 
-// ---------------------------- Register ------------------------------
-async function onRegister(){
-  await loadABIs(); await initContracts();
-  const fee = await muaban.REG_FEE();
-  const allowance = await vin.allowance(account, CONTRACTS.MUABAN);
-  if (allowance.lt(fee)){
-    const tx1 = await vin.populateTransaction.approve(CONTRACTS.MUABAN, fee); tx1.from = account;
-    const err = await simulate(tx1); if (err){ toast('Approve lỗi: '+err); return; }
-    await (await (vin.connect(signer)).approve(CONTRACTS.MUABAN, fee, legacyOverrides('med'))).wait();
-  }
-  const tx2 = await muaban.populateTransaction.payRegistration(); tx2.from = account;
-  const err2 = await simulate(tx2); if (err2){ toast('Đăng ký lỗi: '+err2); return; }
-  await (await (muaban.connect(signer)).payRegistration(legacyOverrides('med'))).wait();
-  toast('Đăng ký thành công.'); await refreshRegistered();
-}
-
-// -------------------------- Create Product --------------------------
-function openCreate(){ $('#formCreate')?.classList.remove('hidden'); }
-function closeModals(){ $$('.modal').forEach(m=>m.classList.add('hidden')); }
-async function onSubmitCreate(){
-  await loadABIs(); await initContracts();
+/* -------------------- Tỷ giá VIN/VND -------------------- */
+async function fetchVinToVND(){
   try{
-    const name  = ($('#createName').value||'').trim();
-    const ipfs  = ($('#createIPFS').value||'').trim();
-    const unit  = ($('#createUnit').value||'').trim();
-    const price = Math.max(1, Number($('#createPrice').value||0));
-    const wall  = ($('#createWallet').value||'').trim();
-    const days  = Math.max(1, Number($('#createDays').value||0));
-    if (!name || !ipfs || !unit || !price || !wall || !days){ toast('Vui lòng nhập đủ thông tin.'); return; }
-    let payout; try{ payout = ethers.utils.getAddress(wall); } catch{ toast('Ví nhận thanh toán không hợp lệ.'); return; }
-    const descriptionCID = 'unit:' + unit; const imageCID = ipfs; const priceBN = ethers.BigNumber.from(String(price));
-    const txPop = await muaban.populateTransaction.createProduct(name, descriptionCID, imageCID, priceBN, days, payout, true);
-    txPop.from = account; const reason = await simulate(txPop); if (reason){ toast('Không thể đăng sản phẩm: ' + reason); return; }
-    const tx = await (muaban.connect(signer)).createProduct(name, descriptionCID, imageCID, priceBN, days, payout, true, legacyOverrides('heavy'));
-    await tx.wait(); toast('Đăng sản phẩm thành công.'); closeModals(); await loadAllProducts(true);
-  }catch(e){ console.error('submitCreate', e); toast('Lỗi khi đăng sản phẩm.'); }
-}
-
-// --------------------------- List Products --------------------------
-let allProductIds = [];
-async function loadAllProducts(force=false){
-  if (!provider || !muaban) return;
-  if (allProductIds.length && !force){ await renderProducts(allProductIds); return; }
-  try{
-    const iface = new ethers.utils.Interface(MUABAN_ABI);
-    const filter = { address: CONTRACTS.MUABAN, topics: [ iface.getEventTopic('ProductCreated') ] };
-    const logs = await provider.getLogs({ ...filter, fromBlock: 0, toBlock: 'latest' });
-    const ids = new Set();
-    for (const lg of logs){
-      try{ const parsed = iface.parseLog(lg); const pid = parsed.args.productId?.toString?.() || parsed.args[0]?.toString?.(); if (pid) ids.add(pid); }catch{}
+    // Override thủ công qua <body data-vin-vnd="631214">
+    const override = Number(document.body.dataset.vinVnd);
+    if (Number.isFinite(override) && override > 0){
+      vinVND = Math.floor(override);
+      vinPerVNDWei = ethers.BigNumber.from(10**18).div(vinVND);
+      renderPriceChip();
+      return;
     }
-    allProductIds = Array.from(ids).map(x=>Number(x)).sort((a,b)=>b-a);
-    await renderProducts(allProductIds);
-  }catch(e){ console.warn('loadAllProducts', e); }
-}
-function fmtVND(x){ try{ const n = ethers.BigNumber.isBigNumber(x)? x.toString() : String(x); return new Intl.NumberFormat('vi-VN').format(Number(n)); }catch{ return String(x); } }
 
-async function renderProducts(pids){
-  const list = $('#productList'); if (!list) return; list.innerHTML = '';
-  for (const pid of pids){
+    // Nguồn 1: CoinGecko VIC/VND trực tiếp
     try{
-      const p = await muaban.getProduct(pid);
-      const name = p.name; const priceVND = p.priceVND;
-      const img = p.imageCID || ''; const unit = (p.descriptionCID||'').startsWith('unit:') ? p.descriptionCID.slice(5) : (p.descriptionCID||''); 
-      const active = p.active; const seller = p.seller;
+      const res = await fetch(DEFAULTS.COINGECKO_VIC_VND);
+      if (res.ok){
+        const j = await res.json();
+        const vnd = Number(j.viction?.vnd);
+        if (Number.isFinite(vnd) && vnd > 0){
+          vinVND = Math.floor(vnd);
+          vinPerVNDWei = ethers.BigNumber.from(10**18).div(vinVND);
+          renderPriceChip();
+          return;
+        }
+      }
+    }catch(_){}
 
-      const card = el('div','product');
-      // image
-      if (img){
-        const im = el('img'); im.src = img; im.alt = 'product'; im.onerror = function(){ this.style.display='none'; };
-        card.appendChild(im);
+    // Nguồn 2: CoinGecko VIC/USD * USD/VND
+    try{
+      const [res1, res2] = await Promise.all([
+        fetch(DEFAULTS.COINGECKO_VIC_USD),
+        fetch(DEFAULTS.COINGECKO_USD_VND)
+      ]);
+      if (res1.ok && res2.ok){
+        const j1 = await res1.json();
+        const j2 = await res2.json();
+        const usd = Number(j1.viction?.usd);
+        const vnd = Number(j2.tether?.vnd);
+        if (Number.isFinite(usd) && Number.isFinite(vnd) && usd > 0 && vnd > 0){
+          vinVND = Math.floor(usd * vnd);
+          vinPerVNDWei = ethers.BigNumber.from(10**18).div(vinVND);
+          renderPriceChip();
+          return;
+        }
       }
-      // title
-      const t = el('div','p-title'); t.textContent = name; card.appendChild(t);
-      // price line
-      const pr = el('div','p-price'); pr.textContent = `Giá: ${fmtVND(priceVND)} / ${unit || '-'}`; card.appendChild(pr);
-      // seller
-      const sl = el('div','p-seller');
-      const a = el('a','mono'); a.target = '_blank'; a.rel = 'noopener';
-      a.href = `${VIC.explorer}/address/${seller}`; a.textContent = shortAddr(String(seller));
-      sl.appendChild(a); card.appendChild(sl);
-      // actions
-      const act = el('div','p-actions');
-      const btnBuy = el('button','btn primary'); btnBuy.textContent = 'Mua';
-      btnBuy.onclick = ()=> openBuyModal(pid, name, priceVND, unit);
-      act.appendChild(btnBuy);
-      if (account && String(account).toLowerCase() === String(seller).toLowerCase()){
-        const btnEdit = el('button','btn'); btnEdit.textContent = 'Sửa';
-        btnEdit.onclick = ()=> openUpdateModal(pid, priceVND, p.deliveryDaysMax, p.payoutWallet, active);
-        act.appendChild(btnEdit);
+    }catch(_){}
+
+    // Nguồn 3: Binance VIC/USDT * USD/VND
+    try{
+      const [res1, res2] = await Promise.all([
+        fetch(DEFAULTS.BINANCE_VICUSDT),
+        fetch(DEFAULTS.COINGECKO_USD_VND)
+      ]);
+      if (res1.ok && res2.ok){
+        const j1 = await res1.json();
+        const j2 = await res2.json();
+        const usdt = Number(j1.price);
+        const vnd = Number(j2.tether?.vnd);
+        if (Number.isFinite(usdt) && Number.isFinite(vnd) && usdt > 0 && vnd > 0){
+          vinVND = Math.floor(usdt * vnd);
+          vinPerVNDWei = ethers.BigNumber.from(10**18).div(vinVND);
+          renderPriceChip();
+          return;
+        }
       }
-      card.appendChild(act);
-      list.appendChild(card);
-    }catch(e){ console.warn('renderProduct', pid, e); }
+    }catch(_){}
+  }catch(e){ console.error("fetchVinToVND:", e); }
+  vinVND = 0;
+  vinPerVNDWei = ethers.BigNumber.from(0);
+  renderPriceChip();
+}
+function renderPriceChip(){
+  const el = $("#priceChip");
+  if (!el) return;
+  if (!vinVND) {
+    el.innerText = "Đang tải tỷ giá...";
+    return;
   }
+  el.innerText = `1 VIN = ${vinVND.toLocaleString("vi-VN")} VND`;
 }
 
-// --------------------------- Update Product -------------------------
-function openUpdateModal(pid, price, days, wallet, active){
-  $('#formUpdate')?.classList.remove('hidden');
-  $('#updatePid').value = String(pid);
-  $('#updatePrice').value = String(price);
-  $('#updateDays').value = String(days);
-  $('#updateWallet').value = wallet || '';
-  $('#updateActive').checked = !!active;
-}
-async function onSubmitUpdate(){
-  await loadABIs(); await initContracts();
+/* -------------------- Wallet -------------------- */
+async function connectWallet(){
   try{
-    const pid = Number($('#updatePid').value||0);
-    const price = Math.max(1, Number($('#updatePrice').value||0));
-    const days = Math.max(1, Number($('#updateDays').value||0));
-    let wall = ($('#updateWallet').value||'').trim();
-    try{ wall = ethers.utils.getAddress(wall); } catch{ toast('Ví nhận thanh toán không hợp lệ.'); return; }
-    const active = !!$('#updateActive').checked;
-    const priceBN = ethers.BigNumber.from(String(price));
-    const txPop = await muaban.populateTransaction.updateProduct(pid, priceBN, days, wall, active);
-    txPop.from = account; const reason = await simulate(txPop); if (reason){ toast('Không thể cập nhật: ' + reason); return; }
-    const tx = await (muaban.connect(signer)).updateProduct(pid, priceBN, days, wall, active, legacyOverrides('med'));
-    await tx.wait(); toast('Cập nhật xong.'); closeModals(); await loadAllProducts(true);
-  }catch(e){ console.error('submitUpdate', e); toast('Lỗi khi cập nhật sản phẩm.'); }
+    if (!window.ethereum) return toast("Cài ví MetaMask trước.");
+    const accs = await providerWrite.send("eth_requestAccounts", []);
+    account = accs[0];
+    signer = providerWrite.getSigner();
+    initContractsForWrite();
+
+    const { muabanR } = initContractsForRead();
+    isRegistered = await muabanR.registered(account);
+    await loadBalances();
+    await loadAllProducts(muabanR);
+    await loadMyProducts(muabanR);
+    await loadMyOrders(muabanR);
+
+    renderWalletBox();
+    bindSearchAndForms();
+    show($("#menuBox"));
+    if (isRegistered) show($("#btnRegister").parentElement);
+    else show($("#btnRegister"));
+  }catch(e){ showRpc(e, "connectWallet"); }
+}
+async function disconnectWallet(){
+  account = null;
+  signer = null;
+  muaban = null;
+  vin = null;
+  isRegistered = false;
+  productsCache = [];
+  ordersBuyer = [];
+  ordersSeller = [];
+  renderWalletBox();
+  renderProducts();
+  renderOrders();
+  hide($("#menuBox"));
+}
+async function loadBalances(){
+  try{
+    const { vinR } = initContractsForRead();
+    const vinBal = await vinR.balanceOf(account);
+    const vicBal = await providerRead.getBalance(account);
+    $("#walletVIN").innerText = ethers.utils.formatUnits(vinBal, 18);
+    $("#walletVIC").innerText = ethers.utils.formatUnits(vicBal, 18);
+  }catch(e){ console.error("loadBalances:", e); }
+}
+function renderWalletBox(){
+  if (!account){
+    show($("#btnConnect"));
+    hide($("#walletBox"));
+    return;
+  }
+  $("#walletAddr").innerText = short(account);
+  loadBalances();
+  hide($("#btnConnect"));
+  show($("#walletBox"));
 }
 
-// ------------------------------ Buy -------------------------------
-let currentBuyPid=null, currentBuyPriceVND=null, currentBuyUnit=null;
-function openBuyModal(pid, name, priceVND, unit){
-  currentBuyPid = pid; currentBuyPriceVND = priceVND; currentBuyUnit = unit;
-  $('#formBuy')?.classList.remove('hidden');
-  const info = $('#buyProductInfo'); if (info){ info.textContent = `${name} — Giá: ${fmtVND(priceVND)} VND/${unit || '-'}`; }
-  $('#buyQty').value = '1'; updateBuyTotal();
+/* -------------------- Đăng ký -------------------- */
+async function registerWallet(){
+  if (isRegistered) return toast("Ví đã đăng ký.");
+  try{
+    // Preflight: simulate
+    try{
+      const txData = await muaban.populateTransaction.payRegistration();
+      txData.from = account;
+      await providerWrite.call(txData);
+    }catch(simErr){ toast(parseRevert(simErr)); return; }
+
+    // Send
+    try{
+      const ov = await buildOverrides("med");
+      const tx = await muaban.payRegistration(ov);
+      await tx.wait();
+    }catch(e){ showRpc(e, "send.payRegistration"); return; }
+
+    toast("Đăng ký thành công!");
+    isRegistered = true;
+    show($("#btnRegister").parentElement);
+  }catch(e){ showRpc(e, "registerWallet.catch"); }
+}
+
+/* -------------------- Build overrides (ép legacy) -------------------- */
+async function buildOverrides(level="med"){
+  const gasPrice = ethers.utils.parseUnits(LEGACY_GAS_PRICE_GWEI, "gwei");
+  let gasLimit;
+  switch(level){
+    case "light": gasLimit = GAS_LIMIT_LIGHT; break;
+    case "med":   gasLimit = GAS_LIMIT_MED; break;
+    case "heavy": gasLimit = GAS_LIMIT_HEAVY; break;
+    default: gasLimit = GAS_LIMIT_MED;
+  }
+  return {
+    type: 0, // Ép legacy
+    gasPrice,
+    gasLimit
+  };
+}
+
+/* -------------------- Load ABI -------------------- */
+async function loadAbis(){
+  try{
+    const resM = await fetch("./Muaban_ABI.json");
+    MUABAN_ABI = await resM.json();
+
+    const resV = await fetch("./VinToken_ABI.json");
+    VIN_ABI = await resV.json();
+  }catch(e){ showRpc(e, "loadAbis"); }
+}
+
+/* -------------------- Sản phẩm -------------------- */
+async function loadAllProducts(muabanR){
+  try{
+    productsCache = [];
+    let pid = 1;
+    while(true){
+      try{
+        const p = await muabanR.getProduct(pid);
+        if (p.seller === ethers.constants.AddressZero) break;
+        productsCache.push(p);
+        pid++;
+      }catch(_){ break; }
+    }
+    renderProducts();
+  }catch(e){ console.error("loadAllProducts:", e); }
+}
+function renderProducts(filter=""){
+  const wrap = $("#productsList");
+  if (!wrap) return;
+  wrap.innerHTML = "";
+  const lowerFilter = filter.toLowerCase().trim();
+
+  const filtered = productsCache.filter(p=>{
+    if (!lowerFilter) return true;
+    return p.name.toLowerCase().includes(lowerFilter);
+  });
+
+  if (!filtered.length){
+    wrap.innerHTML = `<div class="tag">Không tìm thấy sản phẩm.</div>`;
+    return;
+  }
+
+  filtered.forEach(p=>{
+    const isSeller = (p.seller.toLowerCase() === account?.toLowerCase());
+    const isBuyer = !!account && !isSeller;
+    const active = p.active;
+    const card = document.createElement("div");
+    card.className = "product-card";
+    card.innerHTML = `
+      <img class="product-thumb" src="${ipfsToHttp(p.imageCID)}" alt="">
+      <div class="product-info">
+        <div class="product-top">
+          <span class="product-name">${escapeHtml(p.name)}</span>
+          <span class="badge mono">#${p.productId}</span>
+        </div>
+        <div class="product-price">${p.priceVND.toLocaleString("vi-VN")} VND <span class="unit">/ ${parseUnitFromCID(p.descriptionCID)}</span></div>
+        <div class="product-status">Trạng thái: ${active ? "Còn hàng" : "Hết hàng"}</div>
+        <div class="card-actions">
+          ${isBuyer && active ? `<button class="btn primary" data-action="buy" data-pid="${p.productId}">Mua</button>` : ""}
+          ${isSeller ? `<button class="btn" data-action="edit" data-pid="${p.productId}">Cập nhật</button>` : ""}
+        </div>
+      </div>`;
+    card.querySelector('[data-action="buy"]')?.addEventListener("click", ()=>showBuyModal(p.productId));
+    card.querySelector('[data-action="edit"]')?.addEventListener("click", ()=>showEditModal(p));
+    wrap.appendChild(card);
+  });
+}
+
+/* -------------------- My products -------------------- */
+async function loadMyProducts(muabanR){
+  try{
+    if (!account) return;
+    const pids = await muabanR.getSellerProductIds(account);
+    const myProducts = await Promise.all(pids.map(pid=>muabanR.getProduct(pid)));
+    // Có thể render riêng nếu cần, nhưng hiện tại dùng chung productsCache
+  }catch(e){ console.error("loadMyProducts:", e); }
+}
+
+/* -------------------- Modals & Forms -------------------- */
+function bindSearchAndForms(){
+  $("#btnSearch")?.addEventListener("click", ()=>{
+    const q = $("#searchInput").value;
+    renderProducts(q);
+  });
+
+  $("#btnRegister")?.addEventListener("click", registerWallet);
+
+  $("#btnCreate")?.addEventListener("click", showCreateModal);
+  $("#btnOrdersBuy")?.addEventListener("click", showOrdersBuyModal);
+  $("#btnOrdersSell")?.addEventListener("click", showOrdersSellModal);
+
+  $("#formCreate [data-action='submit']")?.addEventListener("click", submitCreate);
+  $("#formEdit [data-action='submit']")?.addEventListener("click", submitEdit);
+  $("#formBuy [data-action='submit']")?.addEventListener("click", submitBuy);
+}
+
+function showCreateModal(){
+  show($("#modalCreate"));
+}
+async function submitCreate(){
+  try{
+    const name = $("#createName").value.trim();
+    const imageCID = $("#createImage").value.trim();
+    const descCID = `unit:${$("#createUnit").value.trim()}`;
+    const priceVND = parseVND($("#createPrice").value);
+    const deliveryDaysMax = Number($("#createDelivery").value);
+    const payoutWallet = $("#createPayout").value.trim();
+    const active = true;
+
+    if (!name) return toast("Tên sản phẩm không được để trống.");
+    if (name.length > 500) return toast("Tên sản phẩm ≤ 500 ký tự.");
+    if (isNaN(priceVND) || priceVND <= 0) return toast("Giá VND phải > 0.");
+    if (isNaN(deliveryDaysMax) || deliveryDaysMax < 1) return toast("Thời gian giao hàng ≥ 1 ngày.");
+    if (!ethers.utils.isAddress(payoutWallet)) return toast("Ví nhận thanh toán không hợp lệ.");
+
+    // Preflight
+    try{
+      const txData = await muaban.populateTransaction.createProduct(
+        name, descCID, imageCID, priceVND, deliveryDaysMax, payoutWallet, active
+      );
+      txData.from = account;
+      await providerWrite.call(txData);
+    }catch(simErr){ toast(parseRevert(simErr)); return; }
+
+    // Send
+    try{
+      const ov = await buildOverrides("heavy");
+      const tx = await muaban.createProduct(
+        name, descCID, imageCID, priceVND, deliveryDaysMax, payoutWallet, active, ov
+      );
+      await tx.wait();
+    }catch(e){ showRpc(e, "send.createProduct"); return; }
+
+    toast("Đăng sản phẩm thành công!");
+    hide($("#modalCreate"));
+    const { muabanR } = initContractsForRead();
+    await loadAllProducts(muabanR);
+  }catch(e){ showRpc(e, "submitCreate.catch"); }
+}
+
+function showEditModal(p){
+  $("#editPid").value = p.productId;
+  $("#editPrice").value = p.priceVND.toString();
+  $("#editDelivery").value = p.deliveryDaysMax;
+  $("#editPayout").value = p.payoutWallet;
+  $("#editActive").checked = p.active;
+  show($("#modalEdit"));
+}
+async function submitEdit(){
+  try{
+    const pid = Number($("#editPid").value);
+    const priceVND = parseVND($("#editPrice").value);
+    const deliveryDaysMax = Number($("#editDelivery").value);
+    const payoutWallet = $("#editPayout").value.trim();
+    const active = $("#editActive").checked;
+
+    if (isNaN(priceVND) || priceVND <= 0) return toast("Giá VND phải > 0.");
+    if (isNaN(deliveryDaysMax) || deliveryDaysMax < 1) return toast("Thời gian giao hàng ≥ 1 ngày.");
+    if (!ethers.utils.isAddress(payoutWallet)) return toast("Ví nhận thanh toán không hợp lệ.");
+
+    // Preflight
+    try{
+      const txData = await muaban.populateTransaction.updateProduct(
+        pid, priceVND, deliveryDaysMax, payoutWallet, active
+      );
+      txData.from = account;
+      await providerWrite.call(txData);
+    }catch(simErr){ toast(parseRevert(simErr)); return; }
+
+    // Send
+    try{
+      const ov = await buildOverrides("med");
+      const tx = await muaban.updateProduct(
+        pid, priceVND, deliveryDaysMax, payoutWallet, active, ov
+      );
+      await tx.wait();
+    }catch(e){ showRpc(e, "send.updateProduct"); return; }
+
+    toast("Cập nhật sản phẩm thành công!");
+    hide($("#modalEdit"));
+    const { muabanR } = initContractsForRead();
+    await loadAllProducts(muabanR);
+  }catch(e){ showRpc(e, "submitEdit.catch"); }
+}
+
+function showBuyModal(pid){
+  $("#buyPid").value = pid;
+  $("#buyQuantity").value = 1;
+  updateBuyTotal();
+  show($("#modalBuy"));
 }
 function updateBuyTotal(){
-  const qty = Math.max(1, Number($('#buyQty').value||0));
-  const totalVND = (Number(currentBuyPriceVND)||0) * qty;
-  const vin_vnd = lastPrice.vin_vnd || 0; let vinTotal = 0;
-  if (vin_vnd > 0) vinTotal = totalVND / vin_vnd;
-  $('#buyTotalVIN').textContent = 'Tổng VIN cần trả: ' + (vinTotal ? vinTotal.toFixed(6) : '…');
+  const pid = Number($("#buyPid").value);
+  const qty = Number($("#buyQuantity").value);
+  const p = productsCache.find(x=>x.productId===pid);
+  if (!p || isNaN(qty) || qty < 1) {
+    $("#buyTotal").innerText = "0";
+    return;
+  }
+  const totalVND = p.priceVND * qty;
+  const vinAmt = ethers.BigNumber.from(totalVND).mul(vinPerVNDWei).div(ethers.BigNumber.from(10**18).div(vinVND + 1)); // ceil approx
+  $("#buyTotal").innerText = ethers.utils.formatUnits(vinAmt, 18);
 }
-async function onSubmitBuy(){
-  await loadABIs(); await initContracts();
+async function submitBuy(){
   try{
-    const qty = Math.max(1, Number($('#buyQty').value||0));
-    const buyerInfo = {
-      name: ($('#buyName').value||'').trim(),
-      address: ($('#buyAddress').value||'').trim(),
-      phone: ($('#buyPhone').value||'').trim(),
-      note:  ($('#buyNote').value||'').trim()
-    };
-    if (!buyerInfo.name || !buyerInfo.address || !buyerInfo.phone){ toast('Vui lòng điền đủ Họ tên, Địa chỉ, SĐT.'); return; }
-    if (!lastPrice.vin_per_vnd_wei || lastPrice.vin_per_vnd_wei.isZero()){
-      await fetchPrices(); if (lastPrice.vin_per_vnd_wei.isZero()){ toast('Không lấy được giá VIN/VND.'); return; }
+    const pid = Number($("#buyPid").value);
+    const qty = Number($("#buyQuantity").value);
+    const name = $("#buyName").value.trim();
+    const addr = $("#buyAddr").value.trim();
+    const phone = $("#buyPhone").value.trim();
+    const note = $("#buyNote").value.trim();
+    const cipher = `name:${name}|addr:${addr}|phone:${phone}|note:${note}`; // TODO: mã hóa thực tế
+
+    if (isNaN(qty) || qty < 1) return toast("Số lượng ≥ 1.");
+    if (!vinPerVNDWei.gt(0)) return toast("Tỷ giá chưa sẵn sàng.");
+
+    // Approve VIN nếu cần
+    const allowance = await vin.allowance(account, DEFAULTS.MUABAN_ADDR);
+    const needVin = ethers.BigNumber.from(p.priceVND).mul(qty).mul(vinPerVNDWei);
+    if (allowance.lt(needVin)){
+      try{
+        const ov = await buildOverrides("light");
+        const tx = await vin.approve(DEFAULTS.MUABAN_ADDR, ethers.constants.MaxUint256, ov);
+        await tx.wait();
+      }catch(e){ showRpc(e, "send.approve"); return; }
     }
-    const totalVND = ethers.BigNumber.from(String(currentBuyPriceVND)).mul(qty);
-    const vinAmountEst = totalVND.mul(lastPrice.vin_per_vnd_wei);
-    const allowance = await vin.allowance(account, CONTRACTS.MUABAN);
-    if (allowance.lt(vinAmountEst)){
-      const tx1 = await vin.populateTransaction.approve(CONTRACTS.MUABAN, vinAmountEst); tx1.from = account;
-      const sim1 = await simulate(tx1); if (sim1){ toast('Approve lỗi: ' + sim1); return; }
-      await (await (vin.connect(signer)).approve(CONTRACTS.MUABAN, vinAmountEst, legacyOverrides('med'))).wait();
+
+    // Preflight
+    try{
+      const txData = await muaban.populateTransaction.placeOrder(pid, qty, vinPerVNDWei, cipher);
+      txData.from = account;
+      await providerWrite.call(txData);
+    }catch(simErr){ toast(parseRevert(simErr)); return; }
+
+    // Send
+    try{
+      const ov = await buildOverrides("med");
+      const tx = await muaban.placeOrder(pid, qty, vinPerVNDWei, cipher, ov);
+      await tx.wait();
+    }catch(e){ showRpc(e, "send.placeOrder"); return; }
+
+    toast("Đặt hàng thành công!");
+    hide($("#modalBuy"));
+    const { muabanR } = initContractsForRead();
+    await loadMyOrders(muabanR);
+  }catch(e){ showRpc(e, "submitBuy.catch"); }
+}
+
+/* -------------------- Đơn hàng -------------------- */
+function showOrdersBuyModal(){
+  renderOrders();
+  show($("#modalOrdersBuy"));
+}
+function showOrdersSellModal(){
+  renderOrders();
+  show($("#modalOrdersSell"));
+}
+async function loadMyOrders(muabanR){
+  try{
+    if (!account) return;
+
+    const iface = new ethers.utils.Interface(MUABAN_ABI);
+    const topic = iface.getEventTopic("OrderPlaced");
+
+    const logs = await providerRead.getLogs({ address: DEFAULTS.MUABAN_ADDR, fromBlock: 0, toBlock: "latest", topics: [topic] });
+
+    ordersBuyer = []; ordersSeller = [];
+    for (const l of logs){
+      const parsed = iface.parseLog(l);
+      const orderId = parsed.args.orderId.toNumber();
+      const buyer = parsed.args.buyer.toLowerCase();
+      const productId = parsed.args.productId.toNumber();
+
+      const o = await muabanR.getOrder(orderId);
+      const p = await muabanR.getProduct(productId);
+      const isBuyer = (buyer === account?.toLowerCase());
+      const isSeller = (p.seller?.toLowerCase() === account?.toLowerCase());
+
+      const item = { order: o, product: p, orderId, productId };
+      if (isBuyer) ordersBuyer.push(item);
+      if (isSeller) ordersSeller.push(item);
     }
-    const note = JSON.stringify(buyerInfo);
-    const txPop = await muaban.populateTransaction.placeOrder(currentBuyPid, qty, lastPrice.vin_per_vnd_wei, note);
-    txPop.from = account; const sim2 = await simulate(txPop); if (sim2){ toast('Không thể đặt hàng: ' + sim2); return; }
-    const tx = await (muaban.connect(signer)).placeOrder(currentBuyPid, qty, lastPrice.vin_per_vnd_wei, note, legacyOverrides('heavy'));
-    await tx.wait(); toast('Đặt hàng thành công.'); closeModals();
-  }catch(e){ console.error('submitBuy', e); toast('Lỗi khi đặt hàng.'); }
+    renderOrders();
+  }catch(e){ console.error("loadMyOrders:", e); }
+}
+function renderOrders(){
+  const bWrap = $("#ordersBuyList");
+  if (bWrap){
+    bWrap.innerHTML = "";
+    if (!ordersBuyer.length){
+      bWrap.innerHTML = `<div class="tag">Chưa có đơn mua.</div>`;
+    }else{
+      ordersBuyer.sort((a,b)=>b.orderId-a.orderId).forEach(({order, product, orderId, productId})=>{
+        const canConfirm = Number(order.status)===1 && order.buyer.toLowerCase()===account.toLowerCase();
+        const canRefund = canConfirm && (Number(order.deadline)*1000 < Date.now());
+        const card = document.createElement("div");
+        card.className = "order-card";
+        card.innerHTML = `
+          <div class="order-row"><span class="order-strong">${escapeHtml(product.name)}</span> <span class="badge mono">#${productId}</span></div>
+          <div class="order-row">Mã đơn: <span class="order-strong mono">#${orderId}</span> · Số lượng: ${order.quantity} · VIN escrow: ${ethers.utils.formatUnits(order.vinAmount,18)}</div>
+          <div class="order-row">Hạn giao: ${new Date(Number(order.deadline)*1000).toLocaleString("vi-VN")}</div>
+          <div class="order-row">Trạng thái: ${statusText(order.status)}</div>
+          <div class="card-actions">
+            ${canConfirm? `<button class="btn primary" data-action="confirm" data-oid="${orderId}">Xác nhận đã nhận</button>`:""}
+            ${canRefund? `<button class="btn" data-action="refund" data-oid="${orderId}">Hoàn tiền (quá hạn)</button>`:""}
+          </div>`;
+        card.querySelector('[data-action="confirm"]')?.addEventListener("click", ()=>confirmReceipt(orderId));
+        card.querySelector('[data-action="refund"]')?.addEventListener("click", ()=>refundExpired(orderId));
+        bWrap.appendChild(card);
+      });
+    }
+  }
+
+  const sWrap = $("#ordersSellList");
+  if (sWrap){
+    sWrap.innerHTML = "";
+    if (!ordersSeller.length){
+      sWrap.innerHTML = `<div class="tag">Chưa có đơn bán.</div>`;
+    }else{
+      ordersSeller.sort((a,b)=>b.orderId-a.orderId).forEach(({order, product, orderId, productId})=>{
+        const card = document.createElement("div");
+        card.className = "order-card";
+        card.innerHTML = `
+          <div class="order-row"><span class="order-strong">${escapeHtml(product.name)}</span> <span class="badge mono">#${productId}</span></div>
+          <div class="order-row">Mã đơn: <span class="order-strong mono">#${orderId}</span> · Buyer: ${short(order.buyer)}</div>
+          <div class="order-row">Số lượng: ${order.quantity} · VIN escrow: ${ethers.utils.formatUnits(order.vinAmount,18)}</div>
+          <div class="order-row">Hạn giao: ${new Date(Number(order.deadline)*1000).toLocaleString("vi-VN")}</div>
+          <div class="order-row">Trạng thái: ${statusText(order.status)}</div>`;
+        sWrap.appendChild(card);
+      });
+    }
+  }
+}
+async function confirmReceipt(orderId){
+  try{
+    try{
+      const txData = await muaban.populateTransaction.confirmReceipt(orderId);
+      txData.from = account;
+      await providerWrite.call(txData);
+    }catch(simErr){ toast(parseRevert(simErr)); return; }
+    try{
+      const ov = await buildOverrides("light");
+      const tx = await muaban.confirmReceipt(orderId, ov);
+      await tx.wait();
+    }catch(e){ showRpc(e, "send.confirmReceipt"); return; }
+    toast("Đã xác nhận nhận hàng. VIN đã giải ngân cho người bán.");
+    const { muabanR } = initContractsForRead();
+    await loadMyOrders(muabanR);
+  }catch(e){ showRpc(e, "confirmReceipt.catch"); }
+}
+async function refundExpired(orderId){
+  try{
+    try{
+      const txData = await muaban.populateTransaction.refundIfExpired(orderId);
+      txData.from = account;
+      await providerWrite.call(txData);
+    }catch(simErr){ toast(parseRevert(simErr)); return; }
+    try{
+      const ov = await buildOverrides("light");
+      const tx = await muaban.refundIfExpired(orderId, ov);
+      await tx.wait();
+    }catch(e){ showRpc(e, "send.refundIfExpired"); return; }
+    toast("Đã hoàn tiền về ví (đơn quá hạn).");
+    const { muabanR } = initContractsForRead();
+    await loadMyOrders(muabanR);
+  }catch(e){ showRpc(e, "refundExpired.catch"); }
 }
 
-// ------------------------- Orders (optional) ------------------------
-async function showOrdersBuy(){ $('#ordersBuySection')?.classList.remove('hidden'); $('#ordersSellSection')?.classList.add('hidden'); }
-async function showOrdersSell(){ $('#ordersSellSection')?.classList.remove('hidden'); $('#ordersBuySection')?.classList.add('hidden'); }
+/* -------------------- Bind & Main -------------------- */
+$("#btnConnect")?.addEventListener("click", connectWallet);
+$("#btnDisconnect")?.addEventListener("click", disconnectWallet);
+$$('.modal').forEach(m=>{
+  m.addEventListener("click", (e)=>{ if (e.target.classList.contains('modal')) hide(e.currentTarget); });
+});
 
-// --------------------------- Search --------------------------------
-function onSearch(){
-  const kw = ($('#searchInput').value||'').trim().toLowerCase();
-  if (!kw){ $$('#productList .product').forEach(el=>el.style.display=''); return; }
-  $$('#productList .product').forEach(el=>{
-    const title = (el.querySelector('.p-title')?.textContent||'').toLowerCase();
-    el.style.display = title.includes(kw) ? '' : 'none';
-  });
-}
-
-// -------------------------- Wiring UI -------------------------------
-function bindUI(){
-  $('#btnConnect')?.addEventListener('click', ()=>connectWallet().catch(err=>{ console.error(err); toast('Kết nối ví thất bại.'); }));
-  $('#btnDisconnect')?.addEventListener('click', ()=>{ location.reload(); });
-  $('#btnRegister')?.addEventListener('click', ()=>onRegister().catch(e=>{ console.error(e); toast('Đăng ký thất bại.'); }));
-  $('#btnCreate')?.addEventListener('click', openCreate);
-  $('#btnSubmitCreate')?.addEventListener('click', ()=>onSubmitCreate().catch(e=>{ console.error(e); }));
-  $('#btnSubmitUpdate')?.addEventListener('click', ()=>onSubmitUpdate().catch(e=>{ console.error(e); }));
-  $('#btnSubmitBuy')?.addEventListener('click', ()=>onSubmitBuy().catch(e=>{ console.error(e); }));
-  $('#btnOrdersBuy')?.addEventListener('click', ()=>showOrdersBuy());
-  $('#btnOrdersSell')?.addEventListener('click', ()=>showOrdersSell());
-  $('#btnSearch')?.addEventListener('click', onSearch);
-  $$('#formCreate .close, #formUpdate .close, #formBuy .close').forEach(el=> el.addEventListener('click', closeModals));
-  $('#buyQty')?.addEventListener('input', updateBuyTotal);
-}
-function setupMenuVisibility(){ /* reserved */ }
-async function boot(){
-  bindUI(); await loadABIs();
-  provider = new ethers.providers.JsonRpcProvider(VIC.rpcUrls[0]);
-  await initContracts(); await fetchPrices(); setInterval(fetchPrices, 60000);
-  await loadAllProducts();
-}
-document.addEventListener('DOMContentLoaded', boot);
-
+(async function main(){
+  try{ await loadAbis(); }catch(e){ showRpc(e, "loadAbis"); return; }
+  initProviders();
+  await fetchVinToVND();
+  setInterval(fetchVinToVND, 60_000);
+  const { muabanR } = initContractsForRead();
+  await loadAllProducts(muabanR);
+  $("#menuBox")?.classList.add('hidden');
 })();
