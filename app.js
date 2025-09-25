@@ -1,12 +1,12 @@
 /* ========================================================================
-   muaban.vin — app.js (FULL, fixed v3)
+   muaban.vin — app.js (FULL, fixed v4 — no gas estimation, no seller reveal)
    - Ethers v5 (UMD)
    - Viction (chainId 88)
    - Giá: VND là SỐ NGUYÊN ≥ 1 (không thập phân)
-   - Bỏ preflight gây hiểu nhầm trước khi ký: KHÔNG callStatic.createProduct nữa
-   - Giao dịch có overrides an toàn (from, gasLimit, gasPrice) để tránh "Internal JSON-RPC error"
-   - Đăng ký (approve → payRegistration) sẽ bật ký ví đúng lúc; không báo lỗi trước khi ví hiện
-   - Hiển thị RÕ thông tin người bán (ví seller, ví nhận tiền/payout) + modal chi tiết + link VicScan
+   - Loại bỏ mọi estimateGas/getFeeData (để ví tự ước lượng) → tránh lỗi "Internal JSON-RPC error" trước khi ký
+   - Không còn preflight callStatic trước khi ký (tránh báo lỗi sớm)
+   - Đăng ký (approve → payRegistration) chỉ dùng overrides tối thiểu (hoặc không cần), ví sẽ tự hiện ký
+   - ẨN HOÀN TOÀN thông tin người bán trên UI (không hiển thị seller/payout/links)
    - Toast + link VicScan cho mọi giao dịch; reload & highlight sản phẩm mới
    ======================================================================== */
 
@@ -142,9 +142,7 @@
     const host = ensureToastHost();
     const box = document.createElement("div");
     box.style.cssText = `min-width:280px;max-width:520px;padding:12px 14px;border-radius:10px;box-shadow:0 6px 18px rgba(0,0,0,.12);font-size:14px;line-height:1.4;color:#0b1020;background:#fff;border-left:6px solid ${type==="success"?"#16a34a":type==="error"?"#ef4444":type==="warn"?"#f59e0b":"#3b82f6"}`;
-    // Diệt thông báo JSON-RPC chung chung
-    const safe = String(message||"").replace(/Internal JSON-RPC error\.?/gi, "Ví/RPC trả lỗi chung chung. Vui lòng kiểm tra: đã kết nối ví, đúng mạng Viction, đủ VIC phí gas, đã Đăng ký ví.");
-    box.innerHTML = `<div style=\"font-weight:600;margin-bottom:4px;\">${type.toUpperCase()}</div><div>${safe}</div>`;
+    box.innerHTML = `<div style=\"font-weight:600;margin-bottom:4px;\">${type.toUpperCase()}</div><div>${message||""}</div>`;
     host.appendChild(box);
     setTimeout(()=>{ box.style.opacity="0"; box.style.transform="translateY(-6px)"; box.style.transition="all .25s"; }, timeout-250);
     setTimeout(()=> host.removeChild(box), timeout);
@@ -160,30 +158,6 @@
     if (/replacement/i.test(raw)) return "Giao dịch bị thay thế/hủy. Hãy gửi lại.";
     if (/CALL_EXCEPTION|execution reverted|revert/i.test(raw)) return "Giao dịch bị revert trên chuỗi (kiểm tra tham số/allowance/đăng ký).";
     return raw;
-  }
-
-  // ---- TX helper: overrides an toàn cho MetaMask Mobile ----
-  async function buildSafeOverrides(contract, method, args, provider, account){
-    const ov = { from: account };
-    // gasLimit an toàn
-    try {
-      const est = await contract.estimateGas[method](...args);
-      ov.gasLimit = est.mul(130).div(100); // buffer 30%
-    } catch (e) {
-      ov.gasLimit = ethers.BigNumber.from("500000"); // fallback
-      console.warn("[estimateGas failed] fallback gasLimit=500k", e);
-    }
-    // gasPrice an toàn
-    try {
-      const fee = await provider.getFeeData();
-      let gp = fee.gasPrice;
-      if (!gp || gp.isZero()) gp = ethers.utils.parseUnits("1", "gwei");
-      ov.gasPrice = gp.mul(110).div(100); // buffer 10%
-    } catch (e) {
-      ov.gasPrice = ethers.utils.parseUnits("1", "gwei");
-      console.warn("[getFeeData failed] fallback gasPrice=1 gwei", e);
-    }
-    return ov;
   }
 
   // ---------------------- Chain / Provider ----------------------
@@ -293,22 +267,21 @@
 
   // ---------------------- Registration ----------------------
   async function ensureRegisteredFlow(){
-    // Không dùng callStatic ở đây để tránh lỗi trước khi ký; tiến thẳng approve → payRegistration nếu cần
     const isReg = await muaban.registered(account);
     if(isReg) return true;
 
     const fee = await muaban.REG_FEE();
 
+    // 1) approve nếu cần
     const alw = await vin.allowance(account, MUABAN_ADDR);
     if(alw.lt(fee)){
-      const ov1 = await buildSafeOverrides(vin, "approve", [MUABAN_ADDR, fee], provider, account);
-      const tx1 = await vin.approve(MUABAN_ADDR, fee, ov1);
+      const tx1 = await vin.approve(MUABAN_ADDR, fee); // để ví tự estimate gas
       uiToast(`Approve phí đăng ký… <a href="${explorerTx(tx1.hash)}" target="_blank" rel="noopener">tx</a>`, "info", 6000);
       await tx1.wait();
     }
 
-    const ov2 = await buildSafeOverrides(muaban, "payRegistration", [], provider, account);
-    const tx2 = await muaban.payRegistration(ov2);
+    // 2) payRegistration
+    const tx2 = await muaban.payRegistration();
     uiToast(`Gửi phí đăng ký… <a href="${explorerTx(tx2.hash)}" target="_blank" rel="noopener">tx</a>`, "info", 6000);
     await tx2.wait();
     uiToast("Đăng ký ví thành công.", "success");
@@ -353,38 +326,6 @@
     renderProducts(PRODUCTS);
   }
 
-  // ---- Seller modal (hiển thị rõ người bán) ----
-  let sellerModal;
-  function ensureSellerModal(){
-    if(sellerModal) return sellerModal;
-    sellerModal = document.createElement("div");
-    sellerModal.className = "modal hidden";
-    sellerModal.innerHTML = `
-      <div class="modal-content" style="max-width:560px">
-        <div class="modal-header">
-          <h3>Thông tin người bán</h3>
-          <button class="btn close">Đóng</button>
-        </div>
-        <div class="modal-body" id="sellerBody"></div>
-      </div>`;
-    document.body.appendChild(sellerModal);
-    sellerModal.addEventListener("click", (e)=>{ if(e.target.classList.contains("modal")) closeModal(sellerModal); });
-    sellerModal.querySelector(".btn.close").addEventListener("click", ()=> closeModal(sellerModal));
-    return sellerModal;
-  }
-  function openSellerModal(p){
-    const m = ensureSellerModal();
-    const $body = m.querySelector("#sellerBody");
-    const seller = p.seller;
-    const payout = p.payoutWallet;
-    $body.innerHTML = `
-      <div class="info-row">Ví seller:<br><a class="mono" href="${VIC.EXPLORER}/address/${seller}" target="_blank" rel="noopener">${seller}</a></div>
-      <div class="info-row" style="margin-top:8px">Ví nhận tiền (payout):<br><a class="mono" href="${VIC.EXPLORER}/address/${payout}" target="_blank" rel="noopener">${payout}</a></div>
-      <div class="info-row" style="margin-top:8px;color:#475569;font-size:13px;">Tiền chỉ được chuyển cho người bán khi người mua xác nhận <b>đã nhận hàng</b> (escrow).</div>
-    `;
-    openModal(m);
-  }
-
   function renderProducts(list){
     const q = ($searchInput.value||"").trim().toLowerCase();
     const filtered = q ? list.filter(x => (x.p?.name||"").toLowerCase().includes(q)) : list;
@@ -402,14 +343,6 @@
       const isSeller = account && (account.toLowerCase() === p.seller.toLowerCase());
       const canBuy   = !!account && !isSeller && p.active;
 
-      const sellerBlock = `
-        <div class="seller-meta">
-          Người bán: <span class="mono">${short(p.seller)}</span>
-          · Payout: <span class="mono">${short(p.payoutWallet)}</span>
-          <button class="btn small" data-act="seller" data-pid="${pid}">Xem</button>
-          <a class="btn small" href="${VIC.EXPLORER}/address/${p.seller}" target="_blank" rel="noopener">VicScan</a>
-        </div>`;
-
       const actions = [
         canBuy ? `<button class="btn primary" data-act="buy" data-pid="${pid}">Mua</button>` : "",
         isSeller ? `<button class="btn" data-act="update" data-pid="${pid}">Cập nhật</button>` : ""
@@ -426,7 +359,6 @@
           <div class="product-meta">
             ${priceHtml}
           </div>
-          ${sellerBlock}
           <div class="card-actions">
             ${actions}
           </div>
@@ -436,11 +368,6 @@
 
     $productList.querySelectorAll("[data-act='buy']").forEach(btn=> btn.addEventListener("click", ()=> openBuyModal(Number(btn.dataset.pid))));
     $productList.querySelectorAll("[data-act='update']").forEach(btn=> btn.addEventListener("click", ()=> openUpdateModal(Number(btn.dataset.pid))));
-    $productList.querySelectorAll("[data-act='seller']").forEach(btn=> btn.addEventListener("click", ()=> {
-      const pid = Number(btn.dataset.pid);
-      const item = PRODUCTS.find(x=>x.pid===pid);
-      if(item) openSellerModal(item.p);
-    }));
   }
 
   // ---------------------- Create / Update product ----------------------
@@ -448,7 +375,6 @@
 
   async function submitCreate(){
     try{
-      // Đảm bảo đã có ví + đúng mạng trước khi làm gì
       if(!account) await connect();
       const ok = await ensureViction();
       if(!ok) return;
@@ -456,12 +382,12 @@
       await fetchPrices();
       if(!vndPerVIN_INT || !vinPerVNDWei) throw new Error("Chưa có tỷ giá. Hãy thử lại.");
 
-      // BẮT BUỘC đăng ký trước (sẽ bật ký ví đúng lúc)
+      // BẮT BUỘC đăng ký trước
       await ensureRegisteredFlow();
 
       const name  = ($createName.value||"").trim();
       const ipfs  = ($createIPFS.value||"").trim();
-      const unit  = ($createUnit.value||"").trim(); // client-only
+      const unit  = ($createUnit.value||"").trim();
       let priceIn = Number($createPrice.value||0);
       const days  = parseInt($createDays.value, 10);
       const wallet= ($createWallet.value||"").trim();
@@ -480,21 +406,13 @@
       const payoutWallet = wallet;
       const active = true;
 
-      // KHÔNG dùng callStatic để tránh báo lỗi trước khi ký
-      // Thay vào đó: gửi trực tiếp với overrides an toàn
-      const overrides = await buildSafeOverrides(
-        muaban, "createProduct",
-        [name, descriptionCID, imageCID, priceVND, deliveryDaysMax, payoutWallet, active],
-        provider, account
-      );
-
       $btnSubmitCreate.disabled = true;
       $btnSubmitCreate.textContent = "Đang gửi giao dịch…";
       uiToast("Đang gửi giao dịch tạo sản phẩm… Vui lòng ký trong MetaMask.", "info", 5500);
 
-      // Thử lấy pid dự kiến sau khi mined bằng event (ở đây chỉ reload list, không cần pid)
+      // GỬI TX (KHÔNG overrides gas → để ví tự estimate)
       const tx = await muaban.createProduct(
-        name, descriptionCID, imageCID, priceVND, deliveryDaysMax, payoutWallet, active, overrides
+        name, descriptionCID, imageCID, priceVND, deliveryDaysMax, payoutWallet, active
       );
       uiToast(`Đã gửi TX: <a href="${explorerTx(tx.hash)}" target="_blank" rel="noopener">xem VicScan</a>`, "info", 6500);
 
@@ -508,7 +426,6 @@
       $createWallet.value = ""; $createDays.value = "7";
 
       await loadProducts();
-      // highlight card mới nhất
       const first = document.querySelector('.product-card');
       if(first){ first.classList.add('pulse-new'); setTimeout(()=>first.classList.remove('pulse-new'), 3000); first.scrollIntoView({behavior:'smooth', block:'center'}); }
     }catch(err){
@@ -537,9 +454,8 @@
 
   async function submitUpdate(){
     try{
-      await ensureRegisteredFlow();
-      let price = Math.floor(Number($updatePrice.value||0));
       const pid   = parseInt($updatePid.value, 10);
+      let price = Math.floor(Number($updatePrice.value||0));
       const days  = parseInt($updateDays.value,10)>>>0;
       const wallet= ($updateWallet.value||"").trim();
       const active= !!$updateActive.checked;
@@ -551,8 +467,7 @@
 
       const priceVND = ethers.BigNumber.from(price.toString());
 
-      const overrides = await buildSafeOverrides(muaban, "updateProduct", [pid, priceVND, days, wallet, active], provider, account);
-      const tx = await muaban.updateProduct(pid, priceVND, days, wallet, active, overrides);
+      const tx = await muaban.updateProduct(pid, priceVND, days, wallet, active);
       uiToast(`Đang cập nhật… <a href="${explorerTx(tx.hash)}" target="_blank" rel="noopener">tx</a>`, "info", 6000);
       await tx.wait();
       closeModal($formUpdate);
@@ -574,7 +489,6 @@
       $buyProductInfo.innerHTML = `
         <div><b>${escapeHtml(p.name||"")}</b></div>
         <div>Giá: <span class="order-strong">${fmtVND(parseInt(p.priceVND.toString(),10))} VNĐ</span></div>
-        <div>Người bán: <span class="mono">${short(p.seller)}</span> · Payout: <span class="mono">${short(p.payoutWallet)}</span></div>
         ${img ? `<div><img src="${img}" style="width:100%;max-height:220px;object-fit:cover;border-radius:8px;border:1px solid #eef1f5;" /></div>` : ""}
       `;
       $buyName.value = ""; $buyAddress.value = ""; $buyPhone.value = ""; $buyNote.value = ""; $buyQty.value = "1";
@@ -620,14 +534,12 @@
 
       const allowance = await vin.allowance(account, MUABAN_ADDR);
       if(allowance.lt(estVIN)){
-        const ov1 = await buildSafeOverrides(vin, "approve", [MUABAN_ADDR, estVIN], provider, account);
-        const tx1 = await vin.approve(MUABAN_ADDR, estVIN, ov1);
+        const tx1 = await vin.approve(MUABAN_ADDR, estVIN);
         uiToast(`Approve ~${fmtVIN(estVIN)} VIN… <a href="${explorerTx(tx1.hash)}" target="_blank" rel="noopener">tx</a>`, "info", 6000);
         await tx1.wait();
       }
 
-      const overrides = await buildSafeOverrides(muaban, "placeOrder", [BUYING_PID, ethers.BigNumber.from(qty.toString()), vinPerVNDWei, buyerInfoCipher], provider, account);
-      const tx2 = await muaban.placeOrder(BUYING_PID, ethers.BigNumber.from(qty.toString()), vinPerVNDWei, buyerInfoCipher, overrides);
+      const tx2 = await muaban.placeOrder(BUYING_PID, ethers.BigNumber.from(qty.toString()), vinPerVNDWei, buyerInfoCipher);
       uiToast(`Đặt hàng… <a href="${explorerTx(tx2.hash)}" target="_blank" rel="noopener">tx</a>`, "info", 6000);
       await tx2.wait();
       uiToast("Đặt hàng thành công. VIN đã ký quỹ trong hợp đồng.", "success");
