@@ -1,13 +1,11 @@
 /* ========================================================================
-   muaban.vin — app.js (FULL, fixed v4 — no gas estimation, no seller reveal)
+   muaban.vin — app.js (FULL, fixed v5 — hard gasLimit + post-error decoder, no seller reveal)
    - Ethers v5 (UMD)
    - Viction (chainId 88)
    - Giá: VND là SỐ NGUYÊN ≥ 1 (không thập phân)
-   - Loại bỏ mọi estimateGas/getFeeData (để ví tự ước lượng) → tránh lỗi "Internal JSON-RPC error" trước khi ký
-   - Không còn preflight callStatic trước khi ký (tránh báo lỗi sớm)
-   - Đăng ký (approve → payRegistration) chỉ dùng overrides tối thiểu (hoặc không cần), ví sẽ tự hiện ký
-   - ẨN HOÀN TOÀN thông tin người bán trên UI (không hiển thị seller/payout/links)
-   - Toast + link VicScan cho mọi giao dịch; reload & highlight sản phẩm mới
+   - GIAI ĐOẠN ĐĂNG SẢN PHẨM: set cứng gasLimit (1_500_000) + gasPrice tối thiểu → tránh lỗi estimate/JSON-RPC sau khi ký
+   - KHÔNG preflight callStatic trước khi ký (để ví bật popup). Nếu gửi TX lỗi, ta mới callStatic để GIẢI THÍCH lý do (PRICE_REQUIRED/DELIVERY_REQUIRED/PAYOUT_WALLET_ZERO/NOT_REGISTERED…)
+   - ẨN HOÀN TOÀN thông tin người bán trên UI
    ======================================================================== */
 
 (() => {
@@ -158,6 +156,29 @@
     if (/replacement/i.test(raw)) return "Giao dịch bị thay thế/hủy. Hãy gửi lại.";
     if (/CALL_EXCEPTION|execution reverted|revert/i.test(raw)) return "Giao dịch bị revert trên chuỗi (kiểm tra tham số/allowance/đăng ký).";
     return raw;
+  }
+
+  // ---- Reason decoder from revert string ----
+  function extractReason(e){
+    const raw = e && (e.error && (e.error.message || (e.error.data && e.error.data.message)) || e.data && e.data.message || e.reason || e.message) || String(e||"");
+    return String(raw);
+  }
+  function mapReasonToVN(r){
+    if(!r) return null;
+    if(/PRICE_REQUIRED/i.test(r)) return "Giá bán (VND) phải > 0.";
+    if(/DELIVERY_REQUIRED/i.test(r)) return "Số ngày giao hàng phải > 0.";
+    if(/PAYOUT_WALLET_ZERO/i.test(r)) return "Ví nhận thanh toán (payout) không được để trống.";
+    if(/NOT_REGISTERED/i.test(r)) return "Ví chưa đăng ký. Vui lòng bấm Đăng ký trước.";
+    if(/VIN_TRANSFER_FAIL/i.test(r)) return "Chuyển VIN thất bại (kiểm tra số dư VIN/allowance).";
+    if(/PRODUCT_NOT_FOUND/i.test(r)) return "Sản phẩm không tồn tại.";
+    if(/PRODUCT_NOT_ACTIVE/i.test(r)) return "Sản phẩm đã tắt bán.";
+    if(/QUANTITY_REQUIRED/i.test(r)) return "Số lượng phải > 0.";
+    if(/VIN_PER_VND_REQUIRED/i.test(r)) return "Thiếu tham số tỷ giá VIN/VND.";
+    if(/NOT_SELLER/i.test(r)) return "Bạn không phải seller của sản phẩm này.";
+    if(/NOT_PLACED/i.test(r)) return "Trạng thái đơn hàng không phù hợp.";
+    if(/NOT_BUYER/i.test(r)) return "Bạn không phải người mua của đơn này.";
+    if(/NOT_EXPIRED/i.test(r)) return "Chưa quá hạn giao hàng.";
+    return null;
   }
 
   // ---------------------- Chain / Provider ----------------------
@@ -410,10 +431,24 @@
       $btnSubmitCreate.textContent = "Đang gửi giao dịch…";
       uiToast("Đang gửi giao dịch tạo sản phẩm… Vui lòng ký trong MetaMask.", "info", 5500);
 
-      // GỬI TX (KHÔNG overrides gas → để ví tự estimate)
-      const tx = await muaban.createProduct(
-        name, descriptionCID, imageCID, priceVND, deliveryDaysMax, payoutWallet, active
-      );
+      // GỬI TX với gasLimit cứng để tránh ví/RPC estimate lỗi
+      const overrides = await (async ()=>{
+        let gp;
+        try { const fee = await provider.getFeeData(); gp = fee.gasPrice && !fee.gasPrice.isZero() ? fee.gasPrice : ethers.utils.parseUnits("1","gwei"); }
+        catch { gp = ethers.utils.parseUnits("1","gwei"); }
+        return { from: account, gasLimit: ethers.BigNumber.from("1500000"), gasPrice: gp };
+      })();
+
+      let tx;
+      try{
+        tx = await muaban.createProduct(
+          name, descriptionCID, imageCID, priceVND, deliveryDaysMax, payoutWallet, active, overrides
+        );
+      }catch(sendErr){
+        try{ await muaban.callStatic.createProduct(name, descriptionCID, imageCID, priceVND, deliveryDaysMax, payoutWallet, active, { from: account }); }
+        catch(simErr){ const reason = mapReasonToVN(extractReason(simErr)); if(reason) throw new Error(reason); }
+        throw sendErr;
+      }
       uiToast(`Đã gửi TX: <a href="${explorerTx(tx.hash)}" target="_blank" rel="noopener">xem VicScan</a>`, "info", 6500);
 
       const rc = await tx.wait();
@@ -467,7 +502,9 @@
 
       const priceVND = ethers.BigNumber.from(price.toString());
 
-      const tx = await muaban.updateProduct(pid, priceVND, days, wallet, active);
+      let tx;
+      try{ tx = await muaban.updateProduct(pid, priceVND, days, wallet, active, { from: account, gasLimit: ethers.BigNumber.from("600000") }); }
+      catch(sendErr){ try{ await muaban.callStatic.updateProduct(pid, priceVND, days, wallet, active, { from: account }); } catch(simErr){ const reason = mapReasonToVN(extractReason(simErr)); if(reason) throw new Error(reason); } throw sendErr; }
       uiToast(`Đang cập nhật… <a href="${explorerTx(tx.hash)}" target="_blank" rel="noopener">tx</a>`, "info", 6000);
       await tx.wait();
       closeModal($formUpdate);
@@ -539,7 +576,9 @@
         await tx1.wait();
       }
 
-      const tx2 = await muaban.placeOrder(BUYING_PID, ethers.BigNumber.from(qty.toString()), vinPerVNDWei, buyerInfoCipher);
+      let tx2;
+      try{ tx2 = await muaban.placeOrder(BUYING_PID, ethers.BigNumber.from(qty.toString()), vinPerVNDWei, buyerInfoCipher, { from: account, gasLimit: ethers.BigNumber.from("800000") }); }
+      catch(sendErr){ try{ await muaban.callStatic.placeOrder(BUYING_PID, ethers.BigNumber.from(qty.toString()), vinPerVNDWei, buyerInfoCipher, { from: account }); } catch(simErr){ const reason = mapReasonToVN(extractReason(simErr)); if(reason) throw new Error(reason); } throw sendErr; }
       uiToast(`Đặt hàng… <a href="${explorerTx(tx2.hash)}" target="_blank" rel="noopener">tx</a>`, "info", 6000);
       await tx2.wait();
       uiToast("Đặt hàng thành công. VIN đã ký quỹ trong hợp đồng.", "success");
