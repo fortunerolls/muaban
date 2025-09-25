@@ -11,7 +11,7 @@ const CONFIG = {
   CHAIN_ID: 88,
   CHAIN_ID_HEX: "0x58",
   RPC_URL: "https://rpc.viction.xyz",
-  EXPLORER: "https://scan.viction.xyz",
+  EXPLORER: "https://vicscan.xyz",
   MUABAN_ADDR: "0x190FD18820498872354eED9C4C080cB365Cd12E0",   // contract mới bạn vừa deploy
   VIN_ADDR: "0x941F63807401efCE8afe3C9d88d368bAA287Fac4"
 };
