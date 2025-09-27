@@ -1,4 +1,3 @@
-<script>
 // ============================
 // muaban.vin — app.js (ethers v5)
 // Đồng bộ với index.html & style.css đã gửi
@@ -738,4 +737,3 @@ $btnSubmitBuy?.addEventListener("click", submitBuy);
     console.warn("init()", e);
   }
 })();
-</script>
