@@ -1,24 +1,24 @@
 // ============================
 // muaban.vin — app.js (ethers v5)
-// Đồng bộ với index.html & style.css đã gửi
 // ============================
 
-/* ====== Cấu hình cố định từ mô tả ====== */
+"use strict";
+
+/* ====== Hằng số & cấu hình ====== */
 const VIC_CHAIN_ID_DEC = 88;
 const VIC_CHAIN_ID_HEX = "0x58";
 const RPC_URL          = "https://rpc.viction.xyz";
 const EXPLORER_ADDR    = "https://www.vicscan.xyz/address/";
 const EXPLORER_TOKEN   = "https://www.vicscan.xyz/token/";
 
-// Hợp đồng & Token (theo file mô tả)
 const MUA_BAN_ADDR = "0x190FD18820498872354eED9C4C080cB365Cd12E0";
 const VIN_ADDR     = "0x941F63807401efCE8afe3C9d88d368bAA287Fac4";
 
-// Nguồn giá (client sẽ fetch trực tiếp)
-const BINANCE_VIC_USDT = "https://api.binance.com/api/v3/ticker/price?symbol=VICUSDT";
+// Nguồn giá
+const BINANCE_VIC_USDT   = "https://api.binance.com/api/v3/ticker/price?symbol=VICUSDT";
 const COINGECKO_USDT_VND = "https://api.coingecko.com/api/v3/simple/price?ids=tether&vs_currencies=vnd";
 
-// DOM refs
+/* ====== DOM refs ====== */
 const $connectBtn   = document.getElementById("btnConnect");
 const $disconnect   = document.getElementById("btnDisconnect");
 const $walletBox    = document.getElementById("walletBox");
@@ -35,15 +35,10 @@ const $btnOrdersSell= document.getElementById("btnOrdersSell");
 
 const $searchInput  = document.getElementById("searchInput");
 const $btnSearch    = document.getElementById("btnSearch");
-
 const $productList  = document.getElementById("productList");
 
-// Modals
+// Modals & inputs
 const $formCreate   = document.getElementById("formCreate");
-const $formUpdate   = document.getElementById("formUpdate");
-const $formBuy      = document.getElementById("formBuy");
-
-// Create form inputs
 const $createName   = document.getElementById("createName");
 const $createIPFS   = document.getElementById("createIPFS");
 const $createUnit   = document.getElementById("createUnit");
@@ -52,7 +47,7 @@ const $createWallet = document.getElementById("createWallet");
 const $createDays   = document.getElementById("createDays");
 const $btnSubmitCreate = document.getElementById("btnSubmitCreate");
 
-// Update form inputs
+const $formUpdate   = document.getElementById("formUpdate");
 const $updatePid    = document.getElementById("updatePid");
 const $updatePrice  = document.getElementById("updatePrice");
 const $updateDays   = document.getElementById("updateDays");
@@ -60,17 +55,17 @@ const $updateWallet = document.getElementById("updateWallet");
 const $updateActive = document.getElementById("updateActive");
 const $btnSubmitUpdate = document.getElementById("btnSubmitUpdate");
 
-// Buy form inputs
+const $formBuy      = document.getElementById("formBuy");
 const $buyProductInfo = document.getElementById("buyProductInfo");
-const $buyName     = document.getElementById("buyName");
-const $buyAddress  = document.getElementById("buyAddress");
-const $buyPhone    = document.getElementById("buyPhone");
-const $buyNote     = document.getElementById("buyNote");
-const $buyQty      = document.getElementById("buyQty");
-const $buyTotalVIN = document.getElementById("buyTotalVIN");
-const $btnSubmitBuy= document.getElementById("btnSubmitBuy");
+const $buyName      = document.getElementById("buyName");
+const $buyAddress   = document.getElementById("buyAddress");
+const $buyPhone     = document.getElementById("buyPhone");
+const $buyNote      = document.getElementById("buyNote");
+const $buyQty       = document.getElementById("buyQty");
+const $buyTotalVIN  = document.getElementById("buyTotalVIN");
+const $btnSubmitBuy = document.getElementById("btnSubmitBuy");
 
-// Orders sections (hiện placeholder vì hợp đồng chưa có index duyệt danh sách)
+// Orders sections
 const $ordersBuySection  = document.getElementById("ordersBuySection");
 const $ordersSellSection = document.getElementById("ordersSellSection");
 const $ordersBuyList     = document.getElementById("ordersBuyList");
@@ -78,17 +73,20 @@ const $ordersSellList    = document.getElementById("ordersSellList");
 
 /* ====== State ====== */
 let provider, web3Provider, signer, myAddr;
-let muaban, vin;
 let MUABAN_ABI, VIN_ABI;
+let muaban, vin;
 let isRegistered = false;
 
-let vndPerVIN = null;  // số VND cho 1 VIN (float)
-let vinPerVND_wei = null; // số VIN-wei cho 1 VND (BigNumber string)
+let vndPerVIN = null;       // float
+let vinPerVND_wei = null;   // BigNumber (VIN-wei cho 1 VND)
 
 /* ====== Helpers UI ====== */
 function short(addr){ return addr ? (addr.slice(0,6) + "…" + addr.slice(-4)) : ""; }
 function fmtVND(n){ return Number(n).toLocaleString("vi-VN"); }
 function fmtVIN(n){ return Number(n).toLocaleString("en-US", { maximumFractionDigits: 6 }); }
+function escapeHtml(s){
+  return String(s||"").replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
 
 // Toast đơn giản
 function toast(msg, type="info"){
@@ -109,33 +107,28 @@ function toast(msg, type="info"){
   setTimeout(()=> el.remove(), 3200);
 }
 
-// Modal open/close
+// Modal open/close và nút đóng
 function openModal(el){ if(!el) return; el.classList.remove("hidden"); document.body.classList.add("no-scroll"); }
 function closeModal(el){ if(!el) return; el.classList.add("hidden"); document.body.classList.remove("no-scroll"); }
 document.querySelectorAll(".modal .close")?.forEach(btn => {
   btn.addEventListener("click", ()=> closeModal(btn.closest(".modal")));
 });
-
-// Bắt sự kiện click nền tối để đóng
 document.querySelectorAll(".modal")?.forEach(modal=>{
-  modal.addEventListener("click", (e)=>{
-    if(e.target === modal) closeModal(modal);
-  });
+  modal.addEventListener("click", (e)=>{ if(e.target === modal) closeModal(modal); });
 });
 
 /* ====== Ethers v5 init ====== */
 async function ensureProviders(){
   if(window.ethereum){
     web3Provider = new ethers.providers.Web3Provider(window.ethereum, "any");
-    provider     = web3Provider; // dùng web3Provider làm default
+    provider     = web3Provider;
   }else{
-    // fallback readonly
     provider = new ethers.providers.JsonRpcProvider(RPC_URL, { chainId: VIC_CHAIN_ID_DEC, name: "Viction" });
   }
 }
 
 async function ensureVictionChain(){
-  if(!window.ethereum) return true; // readonly
+  if(!window.ethereum) return true;
   const cid = await window.ethereum.request({ method:"eth_chainId" });
   if (cid === VIC_CHAIN_ID_HEX) return true;
   try{
@@ -146,7 +139,6 @@ async function ensureVictionChain(){
     return true;
   }catch(err){
     if (err && err.code === 4902){
-      // add chain
       await window.ethereum.request({
         method:"wallet_addEthereumChain",
         params:[{
@@ -163,7 +155,7 @@ async function ensureVictionChain(){
   }
 }
 
-/* ====== Load ABIs ====== */
+/* ====== Load ABIs & build contracts ====== */
 async function loadABIs(){
   const [abiMuaban, abiVin] = await Promise.all([
     fetch("Muaban_ABI.json").then(r=>r.json()),
@@ -172,14 +164,12 @@ async function loadABIs(){
   MUABAN_ABI = abiMuaban;
   VIN_ABI    = abiVin;
 }
-
-/* ====== Build contract instances ====== */
 function buildContracts(){
   muaban = new ethers.Contract(MUA_BAN_ADDR, MUABAN_ABI, signer || provider);
   vin    = new ethers.Contract(VIN_ADDR,     VIN_ABI,    signer || provider);
 }
 
-/* ====== Giá: 1 VIN = (VIC/USDT * 100) * (USDT/VND) ====== */
+/* ====== Giá: 1 VIN = VIC/USDT × 100 × USDT/VND ====== */
 async function refreshPrice(){
   try{
     $vinPriceChip.textContent = "Loading price...";
@@ -191,27 +181,30 @@ async function refreshPrice(){
     const usdt_vnd = Number(cgRes?.tether?.vnd || 0);
     if(!vic_usdt || !usdt_vnd) throw new Error("Không lấy được giá VIC/USDT hoặc USDT/VND");
 
-    vndPerVIN = vic_usdt * 100 * usdt_vnd; // float
-    // VIN-wei cho 1 VND = ceil(1e18 / vndPerVIN)
-    const ONE = ethers.BigNumber.from("1000000000000000000");
-    vinPerVND_wei = ONE.mul(1).div(ethers.BigNumber.from(String(Math.floor(vndPerVIN)))) ; // floor mẫu để tránh chia 0
-    // An toàn hơn: nếu vndPerVIN < 1 thì dùng divRoundUp thủ công
-    if (vndPerVIN < 1){
-      // vinPerVND_wei = ceil(1e18 / vndPerVIN)
-      const scaled = Math.ceil(1e18 / Math.max(vndPerVIN, 1e-9));
-      vinPerVND_wei = ethers.BigNumber.from(String(scaled));
-    }
+    vndPerVIN = vic_usdt * 100 * usdt_vnd; // số VND cho 1 VIN (float)
 
-    $vinPriceChip.textContent = `1 VIN = ${fmtVND(vndPerVIN.toFixed(0))} VND`;
+    // Tính vinPerVND_wei = ceil(1e18 / vndPerVIN) bằng số nguyên lớn để tránh sai số
+    // scale 1e6: vinPerVND = ceil( 1e18 * 1e6 / round(vndPerVIN*1e6) )
+    const ONE      = ethers.BigNumber.from("1000000000000000000"); // 1e18
+    const SCALE    = ethers.BigNumber.from("1000000");
+    const vndScaledNum = Math.max(1, Math.round(vndPerVIN * 1e6));
+    const vndScaled = ethers.BigNumber.from(String(vndScaledNum));
+
+    // ceilDiv(a,b) = (a + b - 1) / b
+    const numer = ONE.mul(SCALE);
+    vinPerVND_wei = numer.add(vndScaled).sub(1).div(vndScaled);
+
+    $vinPriceChip.textContent = `1 VIN = ${fmtVND(Math.round(vndPerVIN))} VND`;
   }catch(e){
     console.warn("refreshPrice()", e);
     $vinPriceChip.textContent = "Price unavailable";
+    vinPerVND_wei = null;
   }
 }
 
-/* ====== Kết nối ví ====== */
+/* ====== Kết nối / Ngắt kết nối ====== */
 async function connect(){
-  if(!window.ethereum){ toast("Không tìm thấy ví. Hãy cài MetaMask.", "warn"); return; }
+  if(!window.ethereum){ return toast("Không tìm thấy ví. Hãy cài MetaMask.", "warn"); }
   try{
     await ensureProviders();
     await ensureVictionChain();
@@ -221,11 +214,9 @@ async function connect(){
 
     buildContracts();
     wireWalletUI(true);
-    await refreshBalances();
-    await checkRegistrationAndMenu();
-    await loadAndRenderProducts(); // load danh sách khi đã có provider
+    await Promise.all([refreshBalances(), checkRegistrationAndMenu()]);
+    await loadAndRenderProducts();
 
-    // Sự kiện mạng/tài khoản
     window.ethereum?.on?.("accountsChanged", ()=> location.reload());
     window.ethereum?.on?.("chainChanged", ()=> location.reload());
   }catch(err){
@@ -233,26 +224,22 @@ async function connect(){
     toast(parseRpcError(err), "error");
   }
 }
-
 function disconnect(){
   signer = undefined; myAddr = undefined;
-  buildContracts(); // trở về provider only
+  buildContracts();
   wireWalletUI(false);
   toast("Đã ngắt kết nối.");
 }
-
 function wireWalletUI(connected){
   if(connected){
-    $connectBtn.classList.add("hidden");
-    $walletBox.classList.remove("hidden");
-    if(myAddr){
-      $acctShort.textContent = short(myAddr);
-      $acctShort.href = EXPLORER_ADDR + myAddr;
-    }
+    $connectBtn?.classList.add("hidden");
+    $walletBox?.classList.remove("hidden");
+    $acctShort.textContent = short(myAddr);
+    $acctShort.href = EXPLORER_ADDR + myAddr;
   }else{
-    $connectBtn.classList.remove("hidden");
-    $walletBox.classList.add("hidden");
-    $menu.classList.add("hidden");
+    $connectBtn?.classList.remove("hidden");
+    $walletBox?.classList.add("hidden");
+    $menu?.classList.add("hidden");
   }
 }
 
@@ -260,12 +247,16 @@ function wireWalletUI(connected){
 async function refreshBalances(){
   try{
     if(!provider) await ensureProviders();
-    // VIC
-    const vicWei = await provider.getBalance(myAddr || ethers.constants.AddressZero);
+    if(!myAddr){
+      $vicBal.textContent = "VIC: 0";
+      $vinBal.textContent = "VIN: 0";
+      return;
+    }
+    const vicWei = await provider.getBalance(myAddr);
     $vicBal.textContent = "VIC: " + fmtVIN(ethers.utils.formatEther(vicWei));
-    // VIN
+
     const vinCtr = new ethers.Contract(VIN_ADDR, VIN_ABI, signer || provider);
-    const vinBal = await vinCtr.balanceOf(myAddr || ethers.constants.AddressZero);
+    const vinBal = await vinCtr.balanceOf(myAddr);
     $vinBal.textContent = "VIN: " + fmtVIN(ethers.utils.formatEther(vinBal));
   }catch(e){
     console.warn("refreshBalances()", e);
@@ -274,19 +265,30 @@ async function refreshBalances(){
   }
 }
 
-/* ====== Đăng ký ví (0.001 VIN) ====== */
+/* ====== Safe-approve pattern ====== */
+async function ensureAllowance(tokenCtr, ownerAddr, spenderAddr, minAmountBN){
+  const current = await tokenCtr.allowance(ownerAddr, spenderAddr);
+  if (current.gte(minAmountBN)) return;
+
+  // Một số token yêu cầu reset về 0 trước
+  if (current.gt(0)){
+    const tx0 = await tokenCtr.approve(spenderAddr, ethers.constants.Zero);
+    toast("Đang reset allowance về 0…");
+    await tx0.wait();
+  }
+  const tx = await tokenCtr.approve(spenderAddr, minAmountBN);
+  toast("Đang approve token…");
+  await tx.wait();
+}
+
+/* ====== Đăng ký ví ====== */
 async function handleRegister(){
   try{
     if(!signer) return toast("Hãy kết nối ví trước.", "warn");
-    const regFee = await muaban.REG_FEE(); // 0.001 * 1e18
-    // Approve cho "spender" là HỢP ĐỒNG Mua Bán (vì contract gọi transferFrom(..., owner, ...))
+    const regFee = await muaban.REG_FEE();
     const vinWithSigner = vin.connect(signer);
-    const allowance = await vinWithSigner.allowance(myAddr, MUA_BAN_ADDR);
-    if (allowance.lt(regFee)){
-      const tx1 = await vinWithSigner.approve(MUA_BAN_ADDR, regFee);
-      toast("Đang approve phí đăng ký…");
-      await tx1.wait();
-    }
+    await ensureAllowance(vinWithSigner, myAddr, MUA_BAN_ADDR, regFee);
+
     const tx2 = await muaban.connect(signer).payRegistration();
     toast("Đang đăng ký ví…");
     await tx2.wait();
@@ -299,24 +301,22 @@ async function handleRegister(){
     toast(parseRpcError(err), "error");
   }
 }
-
 async function checkRegistrationAndMenu(){
   try{
     if(!muaban) buildContracts();
-    if(!myAddr){ $menu.classList.add("hidden"); return; }
+    if(!myAddr){ $menu?.classList.add("hidden"); return; }
     isRegistered = await muaban.registered(myAddr);
-    // Menu hiển thị theo trạng thái
-    $menu.classList.remove("hidden");
+    $menu?.classList.remove("hidden");
     if(!isRegistered){
-      $btnRegister.classList.remove("hidden");
-      $btnCreate.classList.add("hidden");
-      $btnOrdersBuy.classList.add("hidden");
-      $btnOrdersSell.classList.add("hidden");
+      $btnRegister?.classList.remove("hidden");
+      $btnCreate?.classList.add("hidden");
+      $btnOrdersBuy?.classList.add("hidden");
+      $btnOrdersSell?.classList.add("hidden");
     }else{
-      $btnRegister.classList.add("hidden");
-      $btnCreate.classList.remove("hidden");
-      $btnOrdersBuy.classList.remove("hidden");
-      $btnOrdersSell.classList.remove("hidden");
+      $btnRegister?.classList.add("hidden");
+      $btnCreate?.classList.remove("hidden");
+      $btnOrdersBuy?.classList.remove("hidden");
+      $btnOrdersSell?.classList.remove("hidden");
     }
   }catch(e){
     console.warn("checkRegistrationAndMenu()", e);
@@ -335,14 +335,12 @@ function openCreateForm(){
   $createDays.value  = "3";
   openModal($formCreate);
 }
-
 async function submitCreate(){
   try{
     if(!signer) return toast("Hãy kết nối ví trước.", "warn");
-    // Validate
     const name  = ($createName.value||"").trim();
     const ipfs  = ($createIPFS.value||"").trim();
-    const unit  = ($createUnit.value||"").trim();
+    const unit  = ($createUnit.value||"").trim(); // hợp đồng chưa lưu, chỉ hiển thị
     const price = ethers.BigNumber.from(String(Math.max(1, parseInt($createPrice.value||"0",10))));
     const wallet= ($createWallet.value||"").trim();
     const days  = Math.max(1, parseInt($createDays.value||"0",10));
@@ -352,22 +350,17 @@ async function submitCreate(){
 
     const tx = await muaban.connect(signer).createProduct(
       name,
-      ipfs,            // descriptionCID (theo contract)
-      ipfs,            // imageCID (tạm dùng cùng 1 link, UI hiển thị chính là ảnh/video)
+      ipfs,            // descriptionCID
+      ipfs,            // imageCID (tạm dùng cùng 1 link)
       price,           // VND (uint256)
-      days,            // deliveryDaysMax (uint32)
+      days,            // deliveryDaysMax
       wallet,          // payoutWallet
       true             // active
     );
     toast("Đang đăng sản phẩm…");
     const rc = await tx.wait();
-    // Lấy pid từ event ProductCreated
     let pid = null;
-    rc?.events?.forEach(ev=>{
-      if(ev.event === "ProductCreated"){
-        pid = ev.args?.productId?.toString?.() || null;
-      }
-    });
+    rc?.events?.forEach(ev=>{ if(ev.event === "ProductCreated") pid = ev.args?.productId?.toString?.() || null; });
     closeModal($formCreate);
     toast(pid ? `Đăng xong! Mã sản phẩm #${pid}` : "Đăng xong!");
     await loadAndRenderProducts();
@@ -388,10 +381,8 @@ function openUpdateForm(product){
   $updateDays.value   = product.deliveryDaysMax;
   $updateWallet.value = product.payoutWallet;
   $updateActive.checked = !!product.active;
-
   openModal($formUpdate);
 }
-
 async function submitUpdate(){
   try{
     if(!signer) return toast("Hãy kết nối ví trước.", "warn");
@@ -433,7 +424,6 @@ function openBuyForm(product){
   updateBuyTotal();
   openModal($formBuy);
 }
-
 function updateBuyTotal(){
   const qty = Math.max(1, parseInt($buyQty.value||"1",10));
   if(!currentBuyProduct || !vndPerVIN){
@@ -441,11 +431,9 @@ function updateBuyTotal(){
     return;
   }
   const totalVND = Number(currentBuyProduct.priceVND) * qty;
-  // Tính gần đúng để hiển thị (hợp đồng sẽ ceil chính xác)
-  const totalVIN = totalVND / vndPerVIN;
+  const totalVIN = totalVND / vndPerVIN; // chỉ để hiển thị (trên chain đã làm tròn lên)
   $buyTotalVIN.textContent = `Tổng VIN cần trả (ước tính): ${fmtVIN(totalVIN)}`;
 }
-
 $buyQty?.addEventListener("input", updateBuyTotal);
 
 async function submitBuy(){
@@ -453,14 +441,14 @@ async function submitBuy(){
     if(!signer) return toast("Hãy kết nối ví trước.", "warn");
     if(!currentBuyProduct) return;
 
-    // Bảo đảm đã có tỷ giá để truyền vinPerVND
-    if(!vinPerVND_wei || !vndPerVIN){
+    // Bảo đảm đã có tỷ giá để truyền vinPerVND (VIN-wei / 1 VND)
+    if(!vinPerVND_wei){
       await refreshPrice();
       if(!vinPerVND_wei) throw new Error("Không tính được tỷ giá VIN/VND.");
     }
 
     const qty = Math.max(1, parseInt($buyQty.value||"1",10));
-    // Cipher thông tin người mua (AES-GCM đơn giản). Nếu trình duyệt không hỗ trợ, fallback base64.
+    // Mã hóa nhẹ thông tin buyer (AES-GCM; nếu fail -> base64)
     const buyerInfoObj = {
       name: ($buyName.value||"").trim(),
       address: ($buyAddress.value||"").trim(),
@@ -469,23 +457,15 @@ async function submitBuy(){
       t: Date.now()
     };
     let buyerInfoCipher = await encryptBuyerInfo(JSON.stringify(buyerInfoObj)).catch(()=> null);
-    if(!buyerInfoCipher){
-      buyerInfoCipher = "b64:" + btoa(JSON.stringify(buyerInfoObj));
-    }
+    if(!buyerInfoCipher){ buyerInfoCipher = "b64:" + btoa(JSON.stringify(buyerInfoObj)); }
 
-    // Ước tính vinAmount để approve (ceil giống trên chain)
+    // Tính vinAmount để approve (theo công thức trên chain)
     const totalVND = ethers.BigNumber.from(String(currentBuyProduct.priceVND)).mul(qty);
     const vinPerVND = ethers.BigNumber.from(vinPerVND_wei.toString());
-    // vinAmount = ceil(totalVND * vinPerVND / 1)
-    const vinAmount = totalVND.mul(vinPerVND); // đã là wei, chia cho 1 nên giữ nguyên
+    const vinAmount = totalVND.mul(vinPerVND); // (ceil đã được áp dụng ở bước tính vinPerVND bằng ceil(1e18 / VND_per_VIN))
 
     const vinWithSigner = vin.connect(signer);
-    const allowance = await vinWithSigner.allowance(myAddr, MUA_BAN_ADDR);
-    if (allowance.lt(vinAmount)){
-      const tx1 = await vinWithSigner.approve(MUA_BAN_ADDR, vinAmount);
-      toast("Đang approve VIN cho hợp đồng…");
-      await tx1.wait();
-    }
+    await ensureAllowance(vinWithSigner, myAddr, MUA_BAN_ADDR, vinAmount);
 
     const tx2 = await muaban.connect(signer).placeOrder(
       currentBuyProduct.productId,
@@ -496,11 +476,7 @@ async function submitBuy(){
     toast("Đang tạo đơn hàng…");
     const rc = await tx2.wait();
     let oid = null;
-    rc?.events?.forEach(ev=>{
-      if(ev.event === "OrderPlaced"){
-        oid = ev.args?.orderId?.toString?.() || null;
-      }
-    });
+    rc?.events?.forEach(ev=>{ if(ev.event === "OrderPlaced") oid = ev.args?.orderId?.toString?.() || null; });
     closeModal($formBuy);
     toast(oid ? `Đặt hàng thành công! Mã đơn #${oid}` : "Đặt hàng thành công!");
     await refreshBalances();
@@ -511,13 +487,12 @@ async function submitBuy(){
 }
 
 /* ====== Danh sách sản phẩm ======
-   Hợp đồng chưa có tổng số/iterator toàn cục, ta quét ID từ 1..N và bỏ qua ô trống.
-   Để tránh nặng, mặc định quét tối đa 200 ID hoặc đến khi gặp 20 ô trống liên tiếp thì dừng.
+   Quét ID 1..max, dừng khi gặp 20 ô trống liên tiếp hoặc chạm 300.
 */
 async function loadAndRenderProducts(keyword=""){
   try{
     $productList.innerHTML = `<div class="tag">Đang tải sản phẩm…</div>`;
-    const maxScan = 200;
+    const maxScan = 300;
     const emptyCutoff = 20;
     let emptyRun = 0;
     const items = [];
@@ -531,7 +506,6 @@ async function loadAndRenderProducts(keyword=""){
           continue;
         }
         emptyRun = 0;
-        // Chuẩn hóa object cho UI
         items.push(normalizeProduct(pid, p));
       }catch(e){
         emptyRun++;
@@ -539,7 +513,6 @@ async function loadAndRenderProducts(keyword=""){
       }
     }
 
-    // Lọc theo từ khóa tên (client)
     let filtered = items;
     if(keyword){
       const q = keyword.toLowerCase();
@@ -547,22 +520,17 @@ async function loadAndRenderProducts(keyword=""){
     }
 
     if(!filtered.length){
-      $productList.innerHTML = `
-        <div class="tag">Chưa có sản phẩm hiển thị. Hãy bấm <b>Đăng sản phẩm</b> để tạo mới.</div>`;
+      $productList.innerHTML = `<div class="tag">Chưa có sản phẩm hiển thị. Hãy bấm <b>Đăng sản phẩm</b> để tạo mới.</div>`;
       return;
     }
 
     $productList.innerHTML = "";
-    filtered.forEach(prod => {
-      const card = renderProductCard(prod);
-      $productList.appendChild(card);
-    });
+    filtered.forEach(prod => $productList.appendChild(renderProductCard(prod)));
   }catch(e){
     console.error("loadAndRenderProducts()", e);
     $productList.innerHTML = `<div class="tag">Lỗi tải sản phẩm: ${escapeHtml(String(e.message||e))}</div>`;
   }
 }
-
 function normalizeProduct(pid, p){
   return {
     productId: pid,
@@ -576,10 +544,9 @@ function normalizeProduct(pid, p){
     active: !!p.active,
     createdAt: Number(p.createdAt || 0),
     updatedAt: Number(p.updatedAt || 0),
-    unit: "" // index.html có field unit; hiện hợp đồng chưa lưu unit -> tạm ẩn/ghi "-"
+    unit: "" // hợp đồng chưa lưu "unit"
   };
 }
-
 function renderProductCard(p){
   const div = document.createElement("div");
   div.className = "product-card";
@@ -632,27 +599,17 @@ function renderProductCard(p){
     btnBuy.onclick = ()=> openBuyForm(p);
     actions.appendChild(btnBuy);
   }
-
   return div;
 }
 
-/* ====== Tìm kiếm ====== */
-$btnSearch?.addEventListener("click", ()=>{
-  const kw = ($searchInput.value||"").trim();
-  loadAndRenderProducts(kw);
-});
-
-/* ====== Đơn hàng của tôi (placeholder) ======
-   Ghi chú: Hợp đồng hiện tại chưa có chỉ mục liệt kê đơn theo buyer/seller,
-   nên ở UI hiển thị message hướng dẫn kiểm tra trên VicScan.
-*/
+/* ====== Đơn hàng của tôi (placeholder theo mô tả hiện tại) ====== */
 $btnOrdersBuy?.addEventListener("click", ()=>{
   $ordersSellSection.classList.add("hidden");
   $ordersBuySection.classList.remove("hidden");
   $ordersBuyList.innerHTML = `
     <div class="order-card">
-      Hiện chưa có API liệt kê “Đơn hàng mua” theo ví. 
-      Bạn có thể tra cứu giao dịch “placeOrder” của ví bạn trên VicScan.
+      Chưa có API liệt kê “Đơn hàng mua” theo ví. 
+      Hãy tra cứu giao dịch <b>placeOrder</b> của ví bạn trên VicScan.
     </div>`;
 });
 $btnOrdersSell?.addEventListener("click", ()=>{
@@ -660,49 +617,47 @@ $btnOrdersSell?.addEventListener("click", ()=>{
   $ordersSellSection.classList.remove("hidden");
   $ordersSellList.innerHTML = `
     <div class="order-card">
-      Hiện chưa có API liệt kê “Đơn hàng bán” theo ví. 
-      Vui lòng kiểm tra sự kiện “OrderPlaced” của sản phẩm bạn trên VicScan.
+      Chưa có API liệt kê “Đơn hàng bán” theo ví.
+      Kiểm tra sự kiện <b>OrderPlaced</b> các sản phẩm của bạn trên VicScan.
     </div>`;
 });
 
-/* ====== Tiện ích khác ====== */
+/* ====== Tiện ích ====== */
 function ipfsToHttp(link){
   if(!link) return "";
   if (link.startsWith("ipfs://")) return "https://ipfs.io/ipfs/" + link.replace("ipfs://","");
   return link;
 }
-function escapeHtml(s){
-  return String(s||"").replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-}
-
-// Parse lỗi JSON-RPC dễ hiểu
 function parseRpcError(err){
   const m = err?.data?.message || err?.error?.message || err?.message || String(err);
   if(/INSUFFICIENT_FUNDS/i.test(m)) return "Không đủ VIC để trả gas.";
-  if(/NOT_REGISTERED/i.test(m)) return "Ví chưa đăng ký. Vui lòng bấm Đăng ký (0.001 VIN).";
+  if(/NOT_REGISTERED/i.test(m))     return "Ví chưa đăng ký. Vui lòng bấm Đăng ký (0.001 VIN).";
+  if(/ALREADY_REGISTERED/i.test(m)) return "Ví đã đăng ký rồi.";
   if(/PRICE_REQUIRED|DELIVERY_REQUIRED|PAYOUT_WALLET_ZERO/i.test(m)) return "Dữ liệu sản phẩm chưa hợp lệ.";
-  if(/transfer amount exceeds balance|VIN_TRANSFER_FAIL/i.test(m)) return "Số dư VIN không đủ.";
+  if(/VIN_TRANSFER_FAIL|exceeds balance/i.test(m)) return "Số dư VIN không đủ.";
+  if(/VIN_DECIMALS_MUST_BE_18/i.test(m)) return "Token VIN không đúng 18 decimals.";
   if(/user rejected transaction/i.test(m)) return "Bạn đã từ chối giao dịch.";
   if(/CHAIN|network/i.test(m)) return "Sai mạng. Hãy chuyển sang Viction.";
   return "Lỗi giao dịch: " + m;
 }
 
-/* ====== Mã hóa AES-GCM đơn giản (UI) ====== */
+// Mã hóa AES-GCM nhẹ (không nhằm bảo mật tuyệt đối — chỉ tránh lưu plaintext on-chain)
 async function encryptBuyerInfo(plainText){
-  if(!window.crypto?.subtle) throw new Error("No SubtleCrypto");
-  // Khóa tạm thời per-session (KHÔNG dùng cho bảo mật mạnh; mục tiêu: không lưu plaintext on-chain)
-  const rawKey = new Uint8Array(32);
-  window.crypto.getRandomValues(rawKey);
-  const key = await window.crypto.subtle.importKey("raw", rawKey, "AES-GCM", false, ["encrypt"]);
-  const iv  = new Uint8Array(12);
-  window.crypto.getRandomValues(iv);
-  const enc = await window.crypto.subtle.encrypt({ name:"AES-GCM", iv }, key, new TextEncoder().encode(plainText));
-  const b64 = btoa(String.fromCharCode(...new Uint8Array(enc)));
-  const ivb64 = btoa(String.fromCharCode(...iv));
-  return `aesgcm:${ivb64}:${b64}`;
+  try{
+    if(!window.crypto?.subtle) throw new Error("No SubtleCrypto");
+    const rawKey = new Uint8Array(32); window.crypto.getRandomValues(rawKey);
+    const key = await window.crypto.subtle.importKey("raw", rawKey, "AES-GCM", false, ["encrypt"]);
+    const iv  = new Uint8Array(12); window.crypto.getRandomValues(iv);
+    const enc = await window.crypto.subtle.encrypt({ name:"AES-GCM", iv }, key, new TextEncoder().encode(plainText));
+    const b64 = btoa(String.fromCharCode(...new Uint8Array(enc)));
+    const ivb64 = btoa(String.fromCharCode(...iv));
+    return `aesgcm:${ivb64}:${b64}`;
+  }catch(_){
+    return null;
+  }
 }
 
-/* ====== Gán sự kiện nút ====== */
+/* ====== Sự kiện nút ====== */
 $connectBtn?.addEventListener("click", connect);
 $disconnect?.addEventListener("click", disconnect);
 $btnRegister?.addEventListener("click", handleRegister);
@@ -710,6 +665,10 @@ $btnCreate?.addEventListener("click", openCreateForm);
 $btnSubmitCreate?.addEventListener("click", submitCreate);
 $btnSubmitUpdate?.addEventListener("click", submitUpdate);
 $btnSubmitBuy?.addEventListener("click", submitBuy);
+$btnSearch?.addEventListener("click", ()=>{
+  const kw = ($searchInput.value||"").trim();
+  loadAndRenderProducts(kw);
+});
 
 /* ====== Khởi động ====== */
 (async function init(){
@@ -718,20 +677,17 @@ $btnSubmitBuy?.addEventListener("click", submitBuy);
     await loadABIs();
     buildContracts();
     refreshPrice();
-    setInterval(refreshPrice, 60_000); // cập nhật mỗi phút
+    setInterval(refreshPrice, 60_000);
 
-    // Nếu đã có tài khoản trong MetaMask, hiển thị ngay số dư & danh sách
     if(window.ethereum){
       const accs = await window.ethereum.request({ method:"eth_accounts" });
       if(accs && accs.length){
-        await connect(); // sẽ tự load tất cả
+        await connect();
       }else{
-        // readonly: vẫn render danh sách sản phẩm
-        await loadAndRenderProducts();
+        await loadAndRenderProducts(); // readonly
       }
     }else{
-      // readonly provider: load sản phẩm
-      await loadAndRenderProducts();
+      await loadAndRenderProducts();   // readonly
     }
   }catch(e){
     console.warn("init()", e);
