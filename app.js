@@ -300,41 +300,80 @@
     $('#btnSubmitCreate')?.addEventListener('click', onSubmitCreate);
   }
 
-  async function onSubmitCreate(){
+async function onSubmitCreate(){
+  try{
+    if(!muaban || !signer) return toast('Chưa kết nối ví.', 'warn');
+
+    // 1) Đã đăng ký chưa?
+    const isReg = await muaban.registered(userAddr);
+    if(!isReg){
+      return toast('Bạn chưa đăng ký ví (0.001 VIN). Bấm nút "Đăng ký" trước khi đăng sản phẩm.', 'warn');
+    } // onlyRegistered -> NOT_REGISTERED nếu bỏ qua  :contentReference[oaicite:3]{index=3}
+
+    // 2) Lấy và kiểm tra dữ liệu form
+    const name  = ($('#createName').value||'').trim();
+    const img   = ($('#createIPFS').value||'').trim();
+    const unit  = ($('#createUnit').value||'').trim();
+    const price = $('#createPrice').value?.trim();
+    const payout= ($('#createWallet').value||'').trim();
+    const days  = $('#createDays').value?.trim();
+
+    if(!name || name.length>500) return toast('Tên sản phẩm phải có (≤500 ký tự).');
+    if(!price || !/^\d+$/.test(price)) return toast('Giá VNĐ phải là số nguyên > 0.');
+    const priceVND = ethers.BigNumber.from(price);
+    if(priceVND.lte(0)) return toast('Giá VNĐ phải > 0.');
+
+    const deliveryDaysMax = Number(days||'0');
+    if(!(deliveryDaysMax>0)) return toast('Thời gian giao hàng (ngày) phải > 0.');
+
+    if(!ethers.utils.isAddress(payout)) return toast('Ví nhận thanh toán không hợp lệ.');
+
+    // 3) Map field theo ABI: descriptionCID = đơn vị; imageCID = link IPFS
+    const descriptionCID = unit;       // :contentReference[oaicite:4]{index=4}
+    const imageCID       = img;
+    const active         = true;
+
+    // 4) callStatic trước để bắt REVERT reason chuẩn
     try{
-      if(!muaban) return;
-
-      const name = ($('#createName').value||'').trim();
-      const img  = ($('#createIPFS').value||'').trim();
-      const unit = ($('#createUnit').value||'').trim();
-      const priceVND = ethers.BigNumber.from($('#createPrice').value||'0');
-      const payout   = ($('#createWallet').value||'').trim();
-      const days     = Number($('#createDays').value||'0');
-
-      if(!name || name.length>500) return toast('Tên sản phẩm phải có (≤500 ký tự).');
-      if(!priceVND.gt(0))          return toast('Giá VNĐ phải > 0.');
-      if(!payout || !ethers.utils.isAddress(payout)) return toast('Ví nhận thanh toán không hợp lệ.');
-      if(!(days>0))                return toast('Thời gian giao hàng (ngày) phải > 0.');
-
-      // DescriptionCID (mô tả) hiện chưa có field riêng trong form 6 trường — ta đặt mô tả trùng đơn vị
-      const descriptionCID = unit; // theo thiết kế tối giản 6 trường trong index.html  :contentReference[oaicite:9]{index=9}
-      const imageCID = img;
-      const active = true;
-
-      const tx = await muaban.createProduct(
-        name, descriptionCID, imageCID,
-        priceVND, days, payout, active
+      await muaban.callStatic.createProduct(
+        name, descriptionCID, imageCID, priceVND, deliveryDaysMax, payout, active
       );
-      toast('Đang đăng sản phẩm…');
-      const rc = await tx.wait();
-      closeModals();
-      await loadProducts(); // refresh list
-      toast('Đăng sản phẩm thành công!');
-    }catch(e){
-      console.error(e);
-      toast('Không thể đăng sản phẩm: Ví/RPC trả lỗi chung. Kiểm tra kết nối ví, mạng VIC, phí gas VIC và thử lại.');
+    }catch(err){
+      const msg = (err?.error?.message || err?.data?.message || err?.message || '').toUpperCase();
+      if(msg.includes('NOT_REGISTERED'))     return toast('Chưa đăng ký ví: bấm "Đăng ký" (0.001 VIN) trước khi đăng.', 'warn');  // :contentReference[oaicite:5]{index=5}
+      if(msg.includes('PRICE_REQUIRED'))     return toast('Giá VNĐ phải > 0.', 'warn');                                            // :contentReference[oaicite:6]{index=6}
+      if(msg.includes('DELIVERY_REQUIRED'))  return toast('Thời gian giao hàng (ngày) phải > 0.', 'warn');                          // :contentReference[oaicite:7]{index=7}
+      if(msg.includes('PAYOUT_WALLET_ZERO')) return toast('Ví nhận thanh toán không được để trống.', 'warn');                       // :contentReference[oaicite:8]{index=8}
+      // Nếu revert khác:
+      return toast('Hợp đồng từ chối giao dịch: ' + (err?.data?.message || err?.message || 'Lý do không xác định'));
     }
+
+    // 5) Ước lượng gas + gửi giao dịch
+    const gasEst = await muaban.estimateGas.createProduct(
+      name, descriptionCID, imageCID, priceVND, deliveryDaysMax, payout, active
+    );
+    const tx = await muaban.createProduct(
+      name, descriptionCID, imageCID, priceVND, deliveryDaysMax, payout, active,
+      { gasLimit: gasEst.mul(120).div(100) }
+    );
+    toast('Đang đăng sản phẩm…');
+    await tx.wait();
+
+    closeModals();
+    await loadProducts();
+    toast('Đăng sản phẩm thành công!');
+  }catch(e){
+    console.error(e);
+    const raw = (e?.data?.message || e?.error?.message || e?.message || '').toUpperCase();
+    if(raw.includes('NOT_REGISTERED'))     return toast('Bạn chưa đăng ký ví. Bấm "Đăng ký" để trả phí 0.001 VIN.', 'warn');
+    if(raw.includes('PRICE_REQUIRED'))     return toast('Giá VNĐ phải > 0.', 'warn');
+    if(raw.includes('DELIVERY_REQUIRED'))  return toast('Thời gian giao hàng (ngày) phải > 0.', 'warn');
+    if(raw.includes('PAYOUT_WALLET_ZERO')) return toast('Ví nhận thanh toán không được để trống.', 'warn');
+
+    // fallback
+    toast('Không thể đăng sản phẩm: lỗi giao dịch / RPC. Kiểm tra: đã kết nối ví, đúng mạng VIC, đủ VIC phí gas, đã Đăng ký ví.');
   }
+}
 
   // Update modal
   function bindUpdateModal(){
