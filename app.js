@@ -1,4 +1,3 @@
-<script>
 // ========================== Muaban.vin — app.js ==========================
 // Ethers v5.7.2 is loaded via CDN in index.html
 
@@ -666,4 +665,3 @@
 
   document.addEventListener('DOMContentLoaded', init);
 })();
-</script>
