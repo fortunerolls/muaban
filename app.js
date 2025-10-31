@@ -440,39 +440,71 @@
   }
 
   async function onSubmitCreate(){
+  try{
+    // 1) Đọc & chuẩn hóa input
+    let name = ($createName.value||'').trim();
+    const ipfs = ($createIPFS.value||'').trim();
+    const unit = ($createUnit.value||'').trim();
+    const priceStr = String(($createPrice.value||'')).trim();
+    const payout = ($createWallet.value||'').trim();
+    const days = parseInt(($createDays.value||'').trim() || '0', 10);
+
+    // ép số nguyên VND (tránh ký tự không phải digit gây revert)
+    if (!/^\d+$/.test(priceStr)) return toast('Giá (VND) phải là số nguyên dương.', 'warn');
+    const priceVND = ethers.BigNumber.from(priceStr);
+
+    // tên + “ · đơn vị” (giới hạn độ dài để tránh revert bởi chuỗi quá dài)
+    if (!name) return toast('Vui lòng nhập Tên.', 'warn');
+    if (unit)  name = `${name} · ${unit}`;
+    if (name.length > 120) return toast('Tên quá dài (>120 ký tự).', 'warn');
+
+    // ipfs/url tối thiểu 6 ký tự (tránh rỗng)
+    if (!ipfs || ipfs.length < 6) return toast('IPFS/URL chưa hợp lệ.', 'warn');
+
+    if (!priceVND.gt(0)) return toast('Giá (VND) phải > 0.', 'warn');
+    if (!(days>0))       return toast('Số ngày giao hàng phải > 0.', 'warn');
+    if (!ethers.utils.isAddress(payout)) return toast('Ví nhận thanh toán không hợp lệ.', 'warn');
+
+    // 2) Bắt buộc đã đăng ký ví
+    const isReg = await muaban.registered(userAddr);
+    if (!isReg) return toast('Ví chưa đăng ký (0.001 VIN). Hãy bấm "Đăng ký ví" trước.', 'warn');
+
+    // 3) Preflight: callStatic để “thử chạy” xem có revert không (bóc lý do trước khi gửi tx)
     try{
-      const name = ($createName.value||'').trim();
-      const ipfs = ($createIPFS.value||'').trim();
-      const unit = ($createUnit.value||'').trim();
-      const priceVND = ethers.BigNumber.from(($createPrice.value||'0').toString());
-      const payout = ($createWallet.value||'').trim();
-      const days = parseInt($createDays.value||'0');
-
-      if (!name || !ipfs || !priceVND.gt(0) || !payout || days<=0){
-        return toast('Vui lòng nhập đủ: Tên, IPFS, Giá, Ví nhận, Ngày giao.', 'warn');
-      }
-      // Persist unit by appending to name (since contract model lacks "unit")
-      const finalName = unit ? `${name} · ${unit}` : name;
-
-      const tx = await muaban.connect(signer).createProduct(
-        finalName,
-        ipfs,                 // descriptionCID (tạm lưu ipfs)
-        ipfs,                 // imageCID (cùng link)
-        priceVND.toString(),
-        days,
-        payout,
-        true                  // active default
+      await muaban.connect(signer).callStatic.createProduct(
+        name, ipfs, ipfs, priceVND.toString(), days, payout, true
       );
-      toast('Đang đăng sản phẩm…');
-      const rc = await tx.wait();
-      toast('Đăng sản phẩm thành công.');
-      closeModals();
-      await scanAndRenderProducts(); // refresh list
-    }catch(e){
-      console.error(e);
-      toast('Không thể đăng sản phẩm: Ví/RPC trả lỗi chung. Kiểm tra kết nối ví, mạng VIC, phí gas VIC và thử lại.', 'error');
+    }catch(preErr){
+      const why = decodeRevertReason(preErr);
+      return toast('Không thể đăng sản phẩm (preflight): ' + (why||'REVERT'), 'error');
     }
+
+    // 4) Ước lượng gas +, gửi giao dịch
+    let gas = ethers.BigNumber.from('250000');
+    try{
+      gas = await muaban.connect(signer).estimateGas.createProduct(
+        name, ipfs, ipfs, priceVND.toString(), days, payout, true
+      );
+    }catch(estErr){
+      console.warn('[estimateGas failed]', estErr);
+    }
+
+    const tx = await muaban.connect(signer).createProduct(
+      name, ipfs, ipfs, priceVND.toString(), days, payout, true,
+      { gasLimit: gas.mul(120).div(100) } // headroom 20%
+    );
+    toast('Đang đăng sản phẩm…');
+    await tx.wait();
+    toast('Đăng sản phẩm thành công.');
+    closeModals();
+    await scanAndRenderProducts();
+  }catch(e){
+    const reason = decodeRevertReason(e);
+    toast('Không thể đăng sản phẩm: ' + (reason||'Ví/RPC lỗi chung'), 'error');
+    console.error('[createProduct failed]', e);
   }
+}
+
 
   // --------------------------- Update Product ---------------------------
   function openUpdateModal(prod){
